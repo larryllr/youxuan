@@ -1,8 +1,9 @@
 import { connect } from 'cloudflare:sockets';
+
 //此代码为宽宽据joey的代码改良并添加新功能而来
 // ===== 配置区 =====
 const authToken = 'llrnbc57-0f54-4705-bf75-llrnb6d98c06';
-const customPath = 'llr'; // 留空使用 /UUID；填写如 mypath 则使用 /mypath
+const customPath = ''; // 留空使用 /UUID；填写如 mypath 则使用 /mypath
 const manualWorkerRegion = ''; // 可填 US、SG、JP、HK、KR、DE、SE、NL、FI、GB，留空自动检测
 const enableOtherPreferred = true;
 const enableGitHubPreferred = true;
@@ -84,18 +85,24 @@ function subPage(request) {
   const u = new URL(request.url);
   const base = u.origin + u.pathname.replace(/\/+$/, '');
   return new Response(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>订阅中心</title>
-<style>body{font-family:Arial;background:#111;color:#eee;padding:22px}textarea{width:100%;height:130px;box-sizing:border-box;background:#222;color:#0f0;border:1px solid #555;padding:10px}button{padding:10px 14px;margin:10px 8px 0 0}pre{white-space:pre-wrap;word-break:break-all;background:#222;padding:12px}.tip{color:#aaa}</style></head><body>
+<style>body{font-family:Arial;background:#111;color:#eee;padding:22px}textarea{width:100%;height:150px;box-sizing:border-box;background:#222;color:#0f0;border:1px solid #555;padding:10px}button{padding:10px 14px;margin:10px 8px 0 0}pre{white-space:pre-wrap;word-break:break-all;background:#222;padding:12px}.tip{color:#aaa}.ok{color:#0f0}</style></head><body>
 <h2>订阅中心</h2>
-<p class="tip">可在下面临时添加自定义 IP。每行一个，格式：IP:端口#名称。端口不写默认 443。</p>
+<p class="tip">每行一个自定义 IP，格式：IP:端口#名称。端口不写默认 443。点击“保存IP”后会保存在当前浏览器。</p>
 <textarea id="ips" placeholder="104.17.147.116:443#自定义-1&#10;104.19.146.223:443#自定义-2"></textarea>
-<br><button onclick="copySub()">复制订阅链接</button><button onclick="getB64()">获取Base64订阅</button>
-<pre id="out"></pre>
+<br><button onclick="saveIPs()">保存IP</button><button onclick="copySub()">复制订阅链接</button><button onclick="getB64()">获取Base64订阅</button><button onclick="clearIPs()">清空保存</button>
+<p id="msg" class="ok"></p><pre id="out"></pre>
 <script>
-const base=${JSON.stringify(base)};
-function url(){let v=document.getElementById('ips').value.trim();let s=base+'/sub';if(v)s+='?ips='+encodeURIComponent(v.split(/\\n+/).map(x=>x.trim()).filter(Boolean).join(','));return s}
+const base=${JSON.stringify(base)},KEY='cf_custom_ips';
+const ta=document.getElementById('ips'),out=document.getElementById('out'),msg=document.getElementById('msg');
+ta.value=localStorage.getItem(KEY)||'';
+function norm(){return ta.value.split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean).join(',')}
+function saveIPs(){localStorage.setItem(KEY,ta.value.trim());msg.textContent='已保存到当前浏览器';out.textContent=url()}
+function clearIPs(){localStorage.removeItem(KEY);ta.value='';msg.textContent='已清空';out.textContent=url()}
+function url(){let v=norm(),s=base+'/sub';if(v)s+='?ips='+encodeURIComponent(v);return s}
 function cp(t,m){navigator.clipboard&&navigator.clipboard.writeText?navigator.clipboard.writeText(t).then(()=>alert(m)):prompt('复制下面内容',t)}
-function copySub(){let s=url();out.textContent=s;cp(s,'订阅链接已复制')}
-function getB64(){fetch(url()).then(r=>r.text()).then(t=>{out.textContent=t;cp(t,'Base64订阅已复制')}).catch(e=>alert(e))}
+function copySub(){saveIPs();let s=url();out.textContent=s;cp(s,'订阅链接已复制')}
+function getB64(){saveIPs();fetch(url()).then(r=>r.text()).then(t=>{out.textContent=t;cp(t,'Base64订阅已复制')}).catch(e=>alert(e))}
+out.textContent=url();
 </script></body></html>`, { headers: { 'content-type': 'text/html;charset=utf-8' } });
 }
 
