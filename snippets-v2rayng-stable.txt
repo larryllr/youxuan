@@ -17,12 +17,9 @@ const enableGitHubPreferred = true;
 const enableOtherPreferred = true;
 // API地址配置（订阅转换服务）
 const apiBaseUrl = 'https://url.v1.mk/sub';
-// 移动端弱网稳定性：TCP写入/建连超时，避免连接长时间悬挂
-const tcpConnectTimeoutMs = 8000;
-const tcpWriteTimeoutMs = 5000;
-// ECH配置：默认订阅保持普通兼容；订阅链接加 ?ech=1 时额外生成-ECH节点
+// ECH配置：默认同时生成普通节点和-ECH节点，普通节点用于兼容，-ECH节点用于支持ECH的客户端
 const echConfigList = 'godotengine.org+https://dns.alidns.com/dns-query';
-const addECHNodes = false;
+const addECHNodes = true;
 const forceECHOnly = false;
 
 const directDomains = [
@@ -279,25 +276,24 @@ async function handleSubscriptionRequest(request, uuid, url = null) {
 
   const finalLinks = [];
   const workerDomain = url.hostname;
-  const includeECH = addECHNodes || /^(1|true|yes)$/i.test(url.searchParams.get('ech') || '');
 
   const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
-  finalLinks.push(...generateLinksFromSource(nativeList, uuid, workerDomain, includeECH));
+  finalLinks.push(...generateLinksFromSource(nativeList, uuid, workerDomain));
 
   const customIPsRaw = url.searchParams.get('ips') || '';
   if (customIPsRaw) {
     const customIPList = parseUrlCustomIPs(customIPsRaw);
-    if (customIPList.length > 0) finalLinks.push(...generateLinksFromNewIPs(customIPList, uuid, workerDomain, includeECH));
+    if (customIPList.length > 0) finalLinks.push(...generateLinksFromNewIPs(customIPList, uuid, workerDomain));
   }
 
   if (enableOtherPreferred) {
     const domainList = directDomains.map(d => ({ ip: d.domain, isp: d.name || d.domain }));
-    finalLinks.push(...generateLinksFromSource(domainList, uuid, workerDomain, includeECH));
+    finalLinks.push(...generateLinksFromSource(domainList, uuid, workerDomain));
   }
 
   if (enableGitHubPreferred) {
     const newIPList = await fetchAndParseNewIPs();
-    if (newIPList.length > 0) finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain, includeECH));
+    if (newIPList.length > 0) finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain));
   }
 
   if (finalLinks.length === 0) {
@@ -316,7 +312,7 @@ async function handleSubscriptionRequest(request, uuid, url = null) {
   });
 }
 
-function generateLinksFromSource(list, uuid, workerDomain, includeECH = false) {
+function generateLinksFromSource(list, uuid, workerDomain) {
   const httpsPorts = [443];
   const links = [];
   const wsPath = '/?ed=2048';
@@ -328,7 +324,7 @@ function generateLinksFromSource(list, uuid, workerDomain, includeECH = false) {
 
     httpsPorts.forEach(port => {
       const wsNodeName = `${nodeNameBase}-${port}-WS-TLS`;
-      pushWsLinks(links, proto, uuid, safeIP, port, workerDomain, wsPath, wsNodeName, includeECH);
+      pushWsLinks(links, proto, uuid, safeIP, port, workerDomain, wsPath, wsNodeName);
     });
   });
 
@@ -363,7 +359,7 @@ async function fetchAndParseNewIPs() {
   }
 }
 
-function generateLinksFromNewIPs(list, uuid, workerDomain, includeECH = false) {
+function generateLinksFromNewIPs(list, uuid, workerDomain) {
   const links = [];
   const wsPath = '/?ed=2048';
   const proto = 'vless';
@@ -371,15 +367,15 @@ function generateLinksFromNewIPs(list, uuid, workerDomain, includeECH = false) {
   list.forEach(item => {
     const nodeName = item.name;
     const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
-    pushWsLinks(links, proto, uuid, safeIP, item.port, workerDomain, wsPath, nodeName, includeECH);
+    pushWsLinks(links, proto, uuid, safeIP, item.port, workerDomain, wsPath, nodeName);
   });
 
   return links;
 }
 
-function pushWsLinks(links, proto, uuid, safeIP, port, workerDomain, wsPath, nodeName, includeECH = false) {
+function pushWsLinks(links, proto, uuid, safeIP, port, workerDomain, wsPath, nodeName) {
   if (!forceECHOnly) links.push(buildWsLink(proto, uuid, safeIP, port, workerDomain, wsPath, nodeName));
-  if ((includeECH || forceECHOnly) && echConfigList.trim()) {
+  if ((addECHNodes || forceECHOnly) && echConfigList.trim()) {
     links.push(buildWsLink(proto, uuid, safeIP, port, workerDomain, wsPath, `${nodeName}-ECH`, echConfigList.trim()));
   }
 }
@@ -421,6 +417,7 @@ async function handleWsRequest(request, currentFallbackAddress = null) {
           closeSocketQuietly(remoteConnWrapper.socket);
           remoteConnWrapper.socket = null;
           closeSocketQuietly(serverSock);
+          throw err;
         }
         return;
       }
@@ -437,27 +434,19 @@ async function handleWsRequest(request, currentFallbackAddress = null) {
       if (isDnsQuery) return forwardUDP(rawData, serverSock, respHeader);
       await forwardTCP(addressType, hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, fbAddr);
     },
-  })).catch((err) => {
-    console.log('WS Stream Error:', err);
-    closeSocketQuietly(remoteConnWrapper.socket);
-    closeSocketQuietly(serverSock);
-  });
+  })).catch((err) => { console.log('WS Stream Error:', err); });
 
   return new Response(null, { status: 101, webSocket: clientSock });
 }
 
 async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remoteConnWrapper, fbAddr = null) {
-  let retried = false;
-
   async function connectAndSend(address, port) {
-    const remoteSock = await connectWithTimeout(address, port);
+    const remoteSock = connect({ hostname: address, port: port });
     await writeToSocket(remoteSock, rawData);
     return remoteSock;
   }
 
   async function retryConnection() {
-    if (retried || ws.readyState !== 1) return;
-    retried = true;
     let fallbackHost, fallbackPort;
     if (fbAddr && fbAddr.trim()) {
       const parsed = parseAddressAndPort(fbAddr);
@@ -472,15 +461,10 @@ async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remo
       fallbackHost = bestBackupIP ? bestBackupIP.domain : host;
       fallbackPort = bestBackupIP ? bestBackupIP.port : portNum;
     }
-    try {
-      const newSocket = await connectAndSend(fallbackHost || host, fallbackPort);
-      remoteConnWrapper.socket = newSocket;
-      newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
-      connectStreams(newSocket, ws, respHeader, null);
-    } catch (err) {
-      console.log('Fallback connection failed:', err);
-      closeSocketQuietly(ws);
-    }
+    const newSocket = await connectAndSend(fallbackHost || host, fallbackPort);
+    remoteConnWrapper.socket = newSocket;
+    newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
+    connectStreams(newSocket, ws, respHeader, null);
   }
 
   try {
@@ -489,7 +473,7 @@ async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remo
     connectStreams(initialSocket, ws, respHeader, retryConnection);
   } catch (err) {
     console.log('Initial connection failed, trying fallback:', err);
-    await retryConnection();
+    retryConnection();
   }
 }
 
@@ -498,7 +482,6 @@ function parseWsPacketHeader(chunk, token) {
   const version = new Uint8Array(chunk.slice(0, 1));
   if (formatIdentifier(new Uint8Array(chunk.slice(1, 17))) !== token) return { hasError: true, message: E_INVALID_USER };
   const optLen = new Uint8Array(chunk.slice(17, 18))[0];
-  if (chunk.byteLength < 19 + optLen + 2) return { hasError: true, message: E_INVALID_DATA };
   const cmd = new Uint8Array(chunk.slice(18 + optLen, 19 + optLen))[0];
   let isUDP = false;
   if (cmd === 1) { }
@@ -508,24 +491,20 @@ function parseWsPacketHeader(chunk, token) {
   const portIdx = 19 + optLen;
   const port = new DataView(chunk.slice(portIdx, portIdx + 2)).getUint16(0);
   let addrIdx = portIdx + 2, addrLen = 0, addrValIdx = addrIdx + 1, hostname = '';
-  if (chunk.byteLength < addrValIdx) return { hasError: true, message: E_INVALID_DATA };
   const addressType = new Uint8Array(chunk.slice(addrIdx, addrValIdx))[0];
 
   switch (addressType) {
     case ADDRESS_TYPE_IPV4:
       addrLen = 4;
-      if (chunk.byteLength < addrValIdx + addrLen) return { hasError: true, message: E_INVALID_DATA };
       hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.');
       break;
     case ADDRESS_TYPE_URL:
       addrLen = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + 1))[0];
       addrValIdx += 1;
-      if (chunk.byteLength < addrValIdx + addrLen) return { hasError: true, message: E_INVALID_DATA };
       hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen));
       break;
     case ADDRESS_TYPE_IPV6:
       addrLen = 16;
-      if (chunk.byteLength < addrValIdx + addrLen) return { hasError: true, message: E_INVALID_DATA };
       const ipv6 = [];
       const ipv6View = new DataView(chunk.slice(addrValIdx, addrValIdx + addrLen));
       for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
@@ -543,14 +522,7 @@ function makeReadableStream(socket, earlyDataHeader) {
   let cancelled = false;
   return new ReadableStream({
     start(controller) {
-      socket.addEventListener('message', async (event) => {
-        if (cancelled) return;
-        try {
-          controller.enqueue(await toArrayBuffer(event.data));
-        } catch (err) {
-          controller.error(err);
-        }
-      });
+      socket.addEventListener('message', (event) => { if (!cancelled) controller.enqueue(event.data); });
       socket.addEventListener('close', () => { if (!cancelled) { closeSocketQuietly(socket); controller.close(); } });
       socket.addEventListener('error', (err) => controller.error(err));
       const { earlyData, error } = base64ToArray(earlyDataHeader);
@@ -567,10 +539,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
     new WritableStream({
       async write(chunk, controller) {
         hasData = true;
-        if (webSocket.readyState !== 1) {
-          controller.error(E_WS_NOT_OPEN);
-          return;
-        }
+        if (webSocket.readyState !== 1) controller.error(E_WS_NOT_OPEN);
         if (header) {
           webSocket.send(await new Blob([header, chunk]).arrayBuffer());
           header = null;
@@ -580,18 +549,14 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
       },
       abort(reason) { console.error("Readable aborted:", reason); },
     })
-  ).catch((error) => {
-    console.error("Stream connection error:", error);
-    if (hasData || !retryFunc) closeSocketQuietly(webSocket);
-  });
+  ).catch((error) => { console.error("Stream connection error:", error); closeSocketQuietly(webSocket); });
 
-  if (!hasData && retryFunc && webSocket.readyState === 1) await retryFunc();
-  else if (hasData && webSocket.readyState === 1) closeSocketQuietly(webSocket);
+  if (!hasData && retryFunc) retryFunc();
 }
 
 async function forwardUDP(udpChunk, webSocket, respHeader) {
   try {
-    const tcpSocket = await connectWithTimeout('8.8.4.4', 53);
+    const tcpSocket = connect({ hostname: '8.8.4.4', port: 53 });
     let vlessHeader = respHeader;
     await writeToSocket(tcpSocket, udpChunk);
     await tcpSocket.readable.pipeTo(new WritableStream({
@@ -611,36 +576,6 @@ async function forwardUDP(udpChunk, webSocket, respHeader) {
   }
 }
 
-async function connectWithTimeout(hostname, port) {
-  return await withTimeout(Promise.resolve().then(() => connect({ hostname, port })), tcpConnectTimeoutMs, 'TCP connect timeout');
-}
-
-async function writeToSocket(socket, chunk) {
-  if (!socket || !chunk || chunk.byteLength === 0) return;
-  const writer = socket.writable.getWriter();
-  try {
-    await withTimeout(writer.write(chunk), tcpWriteTimeoutMs, 'TCP write timeout');
-  } finally {
-    writer.releaseLock();
-  }
-}
-
-function withTimeout(promise, ms, message) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-async function toArrayBuffer(data) {
-  if (data instanceof ArrayBuffer) return data;
-  if (ArrayBuffer.isView(data)) return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-  if (typeof data === 'string') return new TextEncoder().encode(data).buffer;
-  if (data && typeof data.arrayBuffer === 'function') return await data.arrayBuffer();
-  throw new Error(E_INVALID_DATA);
-}
-
 function base64ToArray(b64Str) {
   if (!b64Str) return { error: null };
   try {
@@ -648,6 +583,16 @@ function base64ToArray(b64Str) {
     return { earlyData: Uint8Array.from(atob(b64Str), (c) => c.charCodeAt(0)).buffer, error: null };
   } catch (error) {
     return { error };
+  }
+}
+
+async function writeToSocket(socket, chunk) {
+  if (!socket || !chunk || chunk.byteLength === 0) return;
+  const writer = socket.writable.getWriter();
+  try {
+    await writer.write(chunk);
+  } finally {
+    try { writer.releaseLock(); } catch (error) { }
   }
 }
 
