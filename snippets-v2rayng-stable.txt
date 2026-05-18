@@ -13,6 +13,8 @@ const customPath = 'llr';
 const githubPreferredURL = 'https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt';
 // 启用GitHub优选IP（true启用，false禁用）
 const enableGitHubPreferred = true;
+// 限制GitHub优选节点数量，降低电脑端批量测速时的并发抖动；0为不限制
+const maxGitHubPreferredNodes = 12;
 // 启用其他优选（域名优选，true启用，false禁用）
 const enableOtherPreferred = true;
 // API地址配置（订阅转换服务）
@@ -351,6 +353,7 @@ async function fetchAndParseNewIPs() {
           port: parseInt(match[2], 10),
           name: match[3].trim() || match[1]
         });
+        if (maxGitHubPreferredNodes > 0 && results.length >= maxGitHubPreferredNodes) break;
       }
     }
     return results;
@@ -440,6 +443,8 @@ async function handleWsRequest(request, currentFallbackAddress = null) {
 }
 
 async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remoteConnWrapper, fbAddr = null) {
+  let retried = false;
+
   async function connectAndSend(address, port) {
     const remoteSock = connect({ hostname: address, port: port });
     await writeToSocket(remoteSock, rawData);
@@ -447,6 +452,8 @@ async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remo
   }
 
   async function retryConnection() {
+    if (retried || ws.readyState !== 1) return;
+    retried = true;
     let fallbackHost, fallbackPort;
     if (fbAddr && fbAddr.trim()) {
       const parsed = parseAddressAndPort(fbAddr);
@@ -461,10 +468,15 @@ async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remo
       fallbackHost = bestBackupIP ? bestBackupIP.domain : host;
       fallbackPort = bestBackupIP ? bestBackupIP.port : portNum;
     }
-    const newSocket = await connectAndSend(fallbackHost || host, fallbackPort);
-    remoteConnWrapper.socket = newSocket;
-    newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
-    connectStreams(newSocket, ws, respHeader, null);
+    try {
+      const newSocket = await connectAndSend(fallbackHost || host, fallbackPort);
+      remoteConnWrapper.socket = newSocket;
+      newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
+      connectStreams(newSocket, ws, respHeader, null);
+    } catch (err) {
+      console.log('Fallback connection failed:', err);
+      closeSocketQuietly(ws);
+    }
   }
 
   try {
@@ -473,7 +485,7 @@ async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remo
     connectStreams(initialSocket, ws, respHeader, retryConnection);
   } catch (err) {
     console.log('Initial connection failed, trying fallback:', err);
-    retryConnection();
+    await retryConnection();
   }
 }
 
@@ -539,7 +551,10 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
     new WritableStream({
       async write(chunk, controller) {
         hasData = true;
-        if (webSocket.readyState !== 1) controller.error(E_WS_NOT_OPEN);
+        if (webSocket.readyState !== 1) {
+          controller.error(E_WS_NOT_OPEN);
+          return;
+        }
         if (header) {
           webSocket.send(await new Blob([header, chunk]).arrayBuffer());
           header = null;
@@ -549,9 +564,12 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
       },
       abort(reason) { console.error("Readable aborted:", reason); },
     })
-  ).catch((error) => { console.error("Stream connection error:", error); closeSocketQuietly(webSocket); });
+  ).catch((error) => {
+    console.error("Stream connection error:", error);
+    if (hasData || !retryFunc || webSocket.readyState !== 1) closeSocketQuietly(webSocket);
+  });
 
-  if (!hasData && retryFunc) retryFunc();
+  if (!hasData && retryFunc && webSocket.readyState === 1) await retryFunc();
 }
 
 async function forwardUDP(udpChunk, webSocket, respHeader) {
