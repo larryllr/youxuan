@@ -11,8 +11,9 @@ const enableOtherPreferred = true;
 const enableRegionMatching = true;
 const tcpConnectTimeoutMs = 8000;
 const tcpWriteTimeoutMs = 5000;
-const enableECH = false;
-const echConfig = '';
+const echConfigList = 'godotengine.org+https://dns.alidns.com/dns-query';
+const addECHNodes = true;
+const forceECHOnly = false;
 
 const directDomains = [
   'cloudflare.182682.xyz', 'speed.marisalnc.com', 'freeyx.cloudflare88.eu.org', 'bestcf.top',
@@ -29,7 +30,7 @@ const backupIPs = [
   ['GB', 'ProxyIP.GB.CMLiussss.net']
 ].map(([regionCode, domain]) => ({ domain, regionCode, port: 443 }));
 
-const A_IPV4 = 1, A_DOMAIN = 2, A_IPV6 = 3;
+const A_IPV4 = 1, A_DOMAIN = 2, A_IPV6 = 3, WS_OPEN = 1, WS_CLOSING = 2;
 const E_DATA = 'invalid data', E_USER = 'invalid user', E_CMD = 'command is not supported';
 const E_UDP = 'UDP proxy only enable for DNS which is port 53';
 let currentWorkerRegion = '';
@@ -125,14 +126,23 @@ async function subText(request, uuid, url = new URL(request.url)) {
 }
 
 function makeLinks(list, uuid, workerDomain) {
-  return list.map(item => {
+  const out = [];
+  for (const item of list) {
     const ip = String(item.ip).includes(':') ? `[${item.ip}]` : item.ip;
     const port = item.port || 443;
-    const ps = new URLSearchParams({ encryption: 'none', security: 'tls', sni: workerDomain, fp: 'randomized', type: 'ws', host: workerDomain, path: '/?ed=2048' });
-    if (enableECH && echConfig.trim()) ps.set('ech', echConfig.trim());
     const name = `${(item.name || item.ip).replace(/\s/g, '_')}-${port}-WS-TLS`;
-    return `vless://${uuid}@${ip}:${port}?${ps.toString()}#${encodeURIComponent(name)}`;
-  });
+    if (!forceECHOnly) out.push(buildLink(uuid, ip, port, workerDomain, name));
+    if ((addECHNodes || forceECHOnly) && echConfigList.trim()) {
+      out.push(buildLink(uuid, ip, port, workerDomain, name + '-ECH', echConfigList.trim()));
+    }
+  }
+  return out;
+}
+
+function buildLink(uuid, ip, port, host, name, ech = '') {
+  const ps = new URLSearchParams({ encryption: 'none', security: 'tls', sni: host, fp: 'randomized', type: 'ws', host, path: '/?ed=2048' });
+  if (ech) ps.set('ech', ech);
+  return `vless://${uuid}@${ip}:${port}?${ps.toString()}#${encodeURIComponent(name)}`;
 }
 
 function parseAddressPort(input) {
@@ -229,7 +239,7 @@ async function forwardTCP(host, port, raw, ws, header, remote, fbAddr) {
     return socket;
   }
   async function retry() {
-    if (retried || ws.readyState !== WebSocket.OPEN) return;
+    if (retried || ws.readyState !== WS_OPEN) return;
     retried = true;
     const p = parseAddressPort(fbAddr || fallbackAddress || ((await getBestBackupIP(currentWorkerRegion))?.domain + ':443') || host);
     try {
@@ -309,7 +319,7 @@ async function connectStreams(socket, ws, header, retry) {
   await socket.readable.pipeTo(new WritableStream({
     async write(chunk, controller) {
       hasData = true;
-      if (ws.readyState !== WebSocket.OPEN) return controller.error('webSocket.readyState is not open');
+      if (ws.readyState !== WS_OPEN) return controller.error('webSocket.readyState is not open');
       if (h) {
         ws.send(await new Blob([h, chunk]).arrayBuffer());
         h = null;
@@ -319,8 +329,8 @@ async function connectStreams(socket, ws, header, retry) {
     console.log('Stream connection error:', err);
     if (hasData || !retry) closeSocketQuietly(ws);
   });
-  if (!hasData && retry && ws.readyState === WebSocket.OPEN) await retry();
-  else if (hasData && ws.readyState === WebSocket.OPEN) closeSocketQuietly(ws);
+  if (!hasData && retry && ws.readyState === WS_OPEN) await retry();
+  else if (hasData && ws.readyState === WS_OPEN) closeSocketQuietly(ws);
 }
 
 async function forwardUDP(chunk, ws, header) {
@@ -331,7 +341,7 @@ async function forwardUDP(chunk, ws, header) {
     let h = header;
     await socket.readable.pipeTo(new WritableStream({
       async write(data) {
-        if (ws.readyState !== WebSocket.OPEN) return;
+        if (ws.readyState !== WS_OPEN) return;
         if (h) {
           ws.send(await new Blob([h, data]).arrayBuffer());
           h = null;
@@ -386,7 +396,7 @@ function base64ToArray(str) {
 function closeSocketQuietly(socket) {
   try {
     if (!socket || typeof socket.close !== 'function') return;
-    if (socket.readyState === undefined || socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) socket.close();
+    if (socket.readyState === undefined || socket.readyState === WS_OPEN || socket.readyState === WS_CLOSING) socket.close();
   } catch {}
 }
 
