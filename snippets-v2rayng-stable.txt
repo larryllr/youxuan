@@ -1,6 +1,6 @@
 import { connect } from 'cloudflare:sockets';
 
-//此代码为宽宽据joey的代码改良并添加新功能而来
+//此代码为宽宽据joey的代码改良并添加新功能而来（其实只剩内核一样了，其它全改完了）
 // ===== 配置区 =====
 const authToken = 'f6eddc57-0f54-4705-bf75-cfd646d98c06';
 let fallbackAddress = '';
