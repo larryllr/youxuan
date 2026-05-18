@@ -2,3 +2,4 @@ snippets文件是我从joey那里的代码借鉴，增加可以自定义优选ip
 部署方式可以参考by-joey的cfnew的snippets部署方式。
 由于snippets限制大小32kb，所以不能写太大，功能不是很完善
 但是超级牛逼。没有workers部署的断流问题，不限量，我这里测速大概300m左右，用就完了
+默认路径：你的网址/llr
