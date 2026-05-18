@@ -17,9 +17,9 @@ const enableGitHubPreferred = true;
 const enableOtherPreferred = true;
 // API地址配置（订阅转换服务）
 const apiBaseUrl = 'https://url.v1.mk/sub';
-// ECH配置：默认同时生成普通节点和-ECH节点，普通节点用于兼容，-ECH节点用于支持ECH的客户端
+// ECH配置：默认关闭，避免客户端ECH兼容性影响测速和连接
 const echConfigList = 'godotengine.org+https://dns.alidns.com/dns-query';
-const addECHNodes = true;
+const addECHNodes = false;
 const forceECHOnly = false;
 
 const directDomains = [
