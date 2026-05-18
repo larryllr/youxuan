@@ -8,7 +8,7 @@ const socks5Config = '';
 // 手动指定地区（留空则自动检测，可选值：US、SG、JP、HK、KR、DE、SE、NL、FI、GB）
 const manualWorkerRegion = '';
 // D短地址（自定义路径，留空则使用UUID路径，支持多级路径如：mypath 或 path/to/sub）
-const customPath = '';
+const customPath = 'llr';
 // GitHub订阅URL（硬编码）
 const githubPreferredURL = 'https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt';
 // 启用GitHub优选IP（true启用，false禁用）
