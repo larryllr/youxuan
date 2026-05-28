@@ -7,13 +7,13 @@
     "enabled": true
   },
   "vars": {
-    "PROXY_HOST": "replace-with-your-snippets-worker.workers.dev"
+    "PROXY_HOST": "snippets-v2rayng-managed-us.2089151168.workers.dev"
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "cf-vless-manager",
-      "database_id": "replace-with-d1-database-id"
+      "database_id": "a70bde8b-3c53-40f7-b4da-8e848f19b5ed"
     }
   ],
   "durable_objects": {
