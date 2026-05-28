@@ -64,6 +64,7 @@ export class UsageMeter {
 
     await ensureNodeLimit(this.env, user.id, node.id, node.default_user_quota_bytes || 0);
     const nodeLimit = await nodeLimitOf(this.env, user.id, node.id);
+    if (nodeLimit?.status && nodeLimit.status !== 'active') return { ok: false, error: 'node_user_disabled' };
     if (!quotaOk(nodeLimit, 0)) return { ok: false, error: 'node_quota_exceeded' };
 
     await this.env.DB.prepare(
@@ -109,8 +110,9 @@ export class UsageMeter {
     await ensureNodeLimit(this.env, user.id, node.id, node.default_user_quota_bytes || 0);
     const nodeLimit = await nodeLimitOf(this.env, user.id, node.id);
     const cutUser = !quotaOk(user, delta);
+    const cutNodeStatus = nodeLimit?.status && nodeLimit.status !== 'active';
     const cutNode = !quotaOk(nodeLimit, delta);
-    const reason = cutUser ? 'quota_exceeded' : (cutNode ? 'node_quota_exceeded' : '');
+    const reason = cutUser ? 'quota_exceeded' : (cutNodeStatus ? 'node_user_disabled' : (cutNode ? 'node_quota_exceeded' : ''));
     const day = new Date(now * 1000).toISOString().slice(0, 10);
 
     await this.env.DB.batch([
@@ -200,6 +202,8 @@ async function handleAdmin(request, env) {
 }
 
 async function usersApi(request, env, id, action) {
+  if (id && action === 'node-limits') return userNodeLimitsApi(request, env, id);
+
   if (request.method === 'GET') {
     if (id) return json({ ok: true, data: await userDetail(env, id) });
     const rows = await all(env.DB,
@@ -212,6 +216,7 @@ async function usersApi(request, env, id, action) {
     const b = await readJson(request);
     const now = unix();
     const plan = b.plan_id ? await first(env.DB, "SELECT * FROM plans WHERE id=?", b.plan_id) : null;
+    const validDays = b.valid_days === undefined || b.valid_days === '' ? null : Number(b.valid_days);
     const user = {
       id: b.id || rid('usr'),
       email: b.email || '',
@@ -219,8 +224,8 @@ async function usersApi(request, env, id, action) {
       uuid: (b.uuid || crypto.randomUUID()).toLowerCase(),
       sub_token: b.sub_token || token(28),
       plan_id: b.plan_id || null,
-      quota_bytes: numOr(b.quota_bytes, plan?.quota_bytes || 0),
-      expires_at: toEpoch(b.expires_at) || (plan?.valid_days ? now + Number(plan.valid_days) * DAY : 0),
+      quota_bytes: quotaValue(b, plan?.quota_bytes || 0),
+      expires_at: validDays !== null ? daysToExpiry(validDays, now) : (toEpoch(b.expires_at) || daysToExpiry(plan?.valid_days || 0, now)),
       device_limit: numOr(b.device_limit, plan?.device_limit || 0),
       speed_limit_bps: numOr(b.speed_limit_bps, plan?.speed_limit_bps || 0),
       status: b.status || 'active',
@@ -239,6 +244,8 @@ async function usersApi(request, env, id, action) {
 
   if (request.method === 'PATCH') {
     const b = await readJson(request);
+    if ('quota_gb' in b) b.quota_bytes = gbToBytes(b.quota_gb);
+    if ('valid_days' in b) b.expires_at = daysToExpiry(b.valid_days, unix());
     const allowed = ['email', 'name', 'uuid', 'sub_token', 'plan_id', 'quota_bytes', 'expires_at', 'device_limit', 'speed_limit_bps', 'status', 'note'];
     await patchRow(env, 'users', id, allowed, b);
     if (Array.isArray(b.group_ids)) await setUserGroups(env, id, b.group_ids);
@@ -261,6 +268,26 @@ async function usersApi(request, env, id, action) {
   return json({ ok: false, error: 'method_not_allowed' }, 405);
 }
 
+async function userNodeLimitsApi(request, env, userId) {
+  if (request.method === 'GET') return json({ ok: true, data: await nodeLimitsForUser(env, userId) });
+  if (request.method === 'PATCH' || request.method === 'POST') {
+    const b = await readJson(request);
+    const rows = Array.isArray(b.limits) ? b.limits : [b];
+    for (const row of rows) {
+      const nodeId = String(row.node_id || row.nodeId || '').trim();
+      if (!nodeId) continue;
+      const now = unix();
+      const quota = 'quota_gb' in row ? gbToBytes(row.quota_gb) : numOr(row.quota_bytes, 0);
+      await env.DB.prepare(
+        "INSERT INTO user_node_limits(user_id,node_id,quota_bytes,used_upload,used_download,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) " +
+        "ON CONFLICT(user_id,node_id) DO UPDATE SET quota_bytes=excluded.quota_bytes,status=excluded.status,updated_at=excluded.updated_at"
+      ).bind(userId, nodeId, quota, 0, 0, row.status || 'active', now, now).run();
+    }
+    return json({ ok: true, data: await nodeLimitsForUser(env, userId) });
+  }
+  return json({ ok: false, error: 'method_not_allowed' }, 405);
+}
+
 async function tableApi(request, env, table, id, allowed, defaults) {
   if (request.method === 'GET') {
     if (id) return json({ ok: true, data: await first(env.DB, `SELECT * FROM ${table} WHERE id=?`, id) });
@@ -268,6 +295,8 @@ async function tableApi(request, env, table, id, allowed, defaults) {
   }
   if (request.method === 'POST' && !id) {
     const b = { ...defaults(), ...(await readJson(request)) };
+    if ('quota_gb' in b) b.quota_bytes = gbToBytes(b.quota_gb);
+    if ('default_user_quota_gb' in b) b.default_user_quota_bytes = gbToBytes(b.default_user_quota_gb);
     b.id = b.id || rid(table.replace(/"/g, '').slice(0, 3));
     b.created_at = unix();
     b.updated_at = b.created_at;
@@ -278,7 +307,10 @@ async function tableApi(request, env, table, id, allowed, defaults) {
   }
   if (!id) return json({ ok: false, error: 'missing_id' }, 400);
   if (request.method === 'PATCH') {
-    await patchRow(env, table, id, allowed, await readJson(request));
+    const b = await readJson(request);
+    if ('quota_gb' in b) b.quota_bytes = gbToBytes(b.quota_gb);
+    if ('default_user_quota_gb' in b) b.default_user_quota_bytes = gbToBytes(b.default_user_quota_gb);
+    await patchRow(env, table, id, allowed, b);
     return json({ ok: true, data: await first(env.DB, `SELECT * FROM ${table} WHERE id=?`, id) });
   }
   if (request.method === 'DELETE') {
@@ -454,8 +486,16 @@ async function userDetail(env, id) {
   const user = await first(env.DB, "SELECT * FROM users WHERE id=?", id);
   if (!user) return null;
   user.group_ids = (await all(env.DB, "SELECT group_id FROM user_groups WHERE user_id=?", id)).map(r => r.group_id);
-  user.node_limits = await all(env.DB, "SELECT * FROM user_node_limits WHERE user_id=? ORDER BY node_id", id);
+  user.node_limits = await nodeLimitsForUser(env, id);
   return user;
+}
+
+async function nodeLimitsForUser(env, userId) {
+  return all(env.DB,
+    "SELECT n.id node_id,n.name node_name,n.enabled node_enabled,n.default_user_quota_bytes default_quota_bytes," +
+    "COALESCE(l.quota_bytes,n.default_user_quota_bytes,0) quota_bytes,COALESCE(l.used_upload,0) used_upload,COALESCE(l.used_download,0) used_download,COALESCE(l.status,'active') status " +
+    "FROM nodes n LEFT JOIN user_node_limits l ON l.node_id=n.id AND l.user_id=? ORDER BY n.sort_order,n.name,n.id",
+    userId);
 }
 
 async function setUserGroups(env, userId, groups) {
@@ -561,6 +601,17 @@ function dbVal(k, v) {
   }
   return v === undefined ? null : v;
 }
+function quotaValue(body, fallback = 0) {
+  return 'quota_gb' in body ? gbToBytes(body.quota_gb) : numOr(body.quota_bytes, fallback);
+}
+function gbToBytes(v) {
+  const n = Number(v || 0);
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 1073741824) : 0;
+}
+function daysToExpiry(days, now) {
+  const n = Number(days || 0);
+  return n > 0 ? now + Math.floor(n) * DAY : 0;
+}
 function numOr(v, d) {
   if (v === '' || v === undefined || v === null) return Number(d || 0);
   const n = Number(v);
@@ -630,33 +681,42 @@ function adminPage(env = {}) {
 <style>
 body{margin:0;font:14px Arial;background:#0f1115;color:#e7e9ee}.wrap{max-width:1180px;margin:auto;padding:20px}input,select,textarea,button{background:#171b22;color:#e7e9ee;border:1px solid #303644;border-radius:6px;padding:9px}textarea{box-sizing:border-box;width:100%;min-height:120px}button{cursor:pointer;background:#23344d}button:hover{background:#2d4364}table{width:100%;border-collapse:collapse;margin:12px 0;table-layout:auto}td,th{border-bottom:1px solid #242a35;padding:8px;text-align:left;vertical-align:top}th{color:#b8c1d1;font-weight:600}section{margin:18px 0;padding:14px;background:#151922;border:1px solid #242a35;border-radius:8px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.card{background:#171b22;border:1px solid #303644;border-radius:8px;padding:12px}.muted{color:#9aa3b2}.row{display:flex;gap:8px;flex-wrap:wrap}.ok{color:#67e08b}.bad{color:#ff8d8d}.wide{min-width:320px}.mono{font-family:Consolas,monospace;word-break:break-all}.mini{font-size:12px;color:#9aa3b2}.ops button{margin:0 5px 5px 0}pre{white-space:pre-wrap;word-break:break-all;background:#090b0f;padding:10px;border-radius:6px}
 </style><div class=wrap><h2>VLESS 订阅管理</h2><section><div class=row><input id=t class=wide placeholder="管理员 Token / ADMIN_TOKEN"><button onclick=save()>保存 Token</button><button onclick=boot()>初始化默认数据</button><button onclick=loadAll()>刷新数据</button></div><p class=muted id=msg></p></section><div class=cards id=sum></div>
-<section><h3>创建用户</h3><div class=grid><input id=uemail placeholder="邮箱 / 账号"><input id=uname placeholder="用户名称"><select id=uplan></select><input id=ugroups placeholder="分组 ID，多个用逗号分隔"><input id=uq placeholder="总流量字节，留空使用套餐"><input id=uexp placeholder="到期时间，ISO 或时间戳"><input id=udev placeholder="设备并发数"></div><p><button onclick=createUser()>创建用户</button></p></section>
+<section><h3>创建用户</h3><div class=grid><input id=uemail placeholder="邮箱 / 账号"><input id=uname placeholder="用户名称"><select id=uplan></select><input id=ugroups placeholder="分组 ID，多个用逗号分隔"><input id=uq placeholder="总流量 GB，留空使用套餐"><input id=udays placeholder="到期天数，0 永不过期，留空使用套餐"><input id=udev placeholder="设备并发数"></div><p><button onclick=createUser()>创建用户</button></p></section>
 <section><h3>用户列表</h3><div id=users></div></section>
-<section><h3>自定义节点管理</h3><div class=grid><input id=nid placeholder="节点 ID，例如 us-01"><input id=nname placeholder="节点名称"><input id=naddr placeholder="入口地址 / 优选 IP / 域名"><input id=nport placeholder="端口，默认 443"><input id=nhost placeholder="代理 Worker 域名，默认 111.freelx.net"><input id=ngroup placeholder="所属分组 ID，默认 default"><input id=npath placeholder="/node/us-01"><input id=nquota placeholder="单用户节点流量上限字节，0 不限"><input id=nsort placeholder="排序，数字越小越靠前"><select id=nenabled><option value=1>启用</option><option value=0>禁用</option></select></div><p class=row><button id=nsave onclick=saveNode()>保存节点</button><button onclick=resetNodeForm()>清空表单</button></p><p class=mini>入口地址可以是优选 IP，也可以是域名；Host/SNI 应保持为你的代理 Worker 域名：${defaultProxyHost}。</p><textarea id=nbulk placeholder="批量导入，每行一个：&#10;104.17.147.116:443#US-优选1&#10;104.19.146.223:443#US-优选2&#10;custom-sg,104.18.1.1:443,SG-自定义,default,0"></textarea><p class=row><button onclick=importNodes()>批量导入节点</button></p><div id=nodes></div></section>
-<section><h3>套餐和分组</h3><div class=row><input id=pname placeholder="套餐名称"><input id=pquota placeholder="套餐总流量字节"><input id=pdays placeholder="有效天数，默认 30"><button onclick=createPlan()>创建套餐</button><input id=gname placeholder="分组名称"><button onclick=createGroup()>创建分组</button></div><div id=plans></div><div id=groups></div></section>
+<section><h3>单用户节点流量限制</h3><div class=row><select id=limitUser></select><button onclick=loadNodeLimits()>加载用户节点</button><button onclick=saveNodeLimits()>保存节点上限</button></div><p class=mini>这里设置的是“某个用户在某个节点”的独立 GB 上限。0 表示不限；超过后该用户访问该节点会断开。</p><div id=nodeLimits></div></section>
+<section><h3>自定义节点管理</h3><div class=grid><input id=nid placeholder="节点 ID，例如 us-01"><input id=nname placeholder="节点名称"><input id=naddr placeholder="入口地址 / 优选 IP / 域名"><input id=nport placeholder="端口，默认 443"><input id=nhost placeholder="代理 Worker 域名，默认 111.freelx.net"><input id=ngroup placeholder="所属分组 ID，默认 default"><input id=npath placeholder="/node/us-01"><input id=nquota placeholder="默认单用户节点上限 GB，0 不限"><input id=nsort placeholder="排序，数字越小越靠前"><select id=nenabled><option value=1>启用</option><option value=0>禁用</option></select></div><p class=row><button id=nsave onclick=saveNode()>保存节点</button><button onclick=resetNodeForm()>清空表单</button></p><p class=mini>入口地址可以是优选 IP，也可以是域名；Host/SNI 应保持为你的代理 Worker 域名：${defaultProxyHost}。</p><textarea id=nbulk placeholder="批量导入，每行一个：&#10;104.17.147.116:443#US-优选1&#10;104.19.146.223:443#US-优选2&#10;custom-sg,104.18.1.1:443,SG-自定义,default,10"></textarea><p class=row><button onclick=importNodes()>批量导入节点</button></p><div id=nodes></div></section>
+<section><h3>套餐和分组</h3><div class=row><input id=pname placeholder="套餐名称"><input id=pquota placeholder="套餐总流量 GB"><input id=pdays placeholder="有效天数，0 永不过期"><button onclick=createPlan()>创建套餐</button><input id=gname placeholder="分组名称"><button onclick=createGroup()>创建分组</button></div><div id=plans></div><div id=groups></div></section>
 <section><h3>最近连接</h3><div id=sessions></div></section></div>
 <script>
-const $=id=>document.getElementById(id),DH=${JSON.stringify(defaultProxyHost)};let nodeRows=[],editingNode='';const L={users:'用户总数',activeUsers:'正常用户',activeNodes:'启用节点',activeSessions:'在线连接',trafficBytes:'已用流量',email:'账号',name:'名称',status:'状态',plan_name:'套餐',groups:'分组',used:'已用/总量',expire:'到期时间',sub:'操作',id:'ID',address:'入口地址',port:'端口',host:'Host',path:'路径',group_id:'分组',enabled:'启用',node_ops:'节点操作',default_user_quota_bytes:'节点默认上限',quota_bytes:'总流量',valid_days:'有效天数',device_limit:'设备数',node_name:'节点',upload:'上传',download:'下载',reason:'断开原因'};
+const $=id=>document.getElementById(id),DH=${JSON.stringify(defaultProxyHost)};let userRows=[],nodeRows=[],limitRows=[],editingNode='';const L={users:'用户总数',activeUsers:'正常用户',activeNodes:'启用节点',activeSessions:'在线连接',trafficBytes:'已用流量',email:'账号',name:'名称',status:'状态',plan_name:'套餐',groups:'分组',used:'已用/总量',expire:'到期时间',sub:'订阅链接 / 操作',id:'ID',address:'入口地址',port:'端口',host:'Host',path:'路径',group_id:'分组',enabled:'启用',node_ops:'节点操作',default_user_quota_bytes:'节点默认上限',quota_bytes:'总流量',valid_days:'有效天数',device_limit:'设备数',node_name:'节点',quota_limit:'节点上限',node_used:'节点已用',upload:'上传',download:'下载',reason:'断开原因'};
 const api=(p,o={})=>fetch('/api/admin/'+p,{...o,headers:{'content-type':'application/json','authorization':'Bearer '+localStorage.token,...(o.headers||{})}}).then(async r=>{let j=await r.json().catch(()=>({ok:false,error:r.statusText}));if(!r.ok||j.ok===false)throw new Error(j.error||r.statusText);return j});
-t.value=localStorage.token||'';function save(){localStorage.token=t.value.trim();msg.textContent='Token 已保存'}function b(x){return (Number(x||0)/1073741824).toFixed(2)+' GB'}function dt(x){return x?new Date(x*1000).toLocaleString():'永不过期'}
-async function loadAll(){try{msg.textContent='正在加载...';let s=await api('summary');sum.innerHTML=Object.entries(s.data).map(([k,v])=>'<div class=card><b>'+h(L[k]||k)+'</b><br>'+(/Bytes/.test(k)?b(v):h(v))+'</div>').join('');let [us,ns,ps,gs,ss]=await Promise.all([api('users'),api('nodes'),api('plans'),api('groups'),api('sessions')]);nodeRows=ns.data||[];uplan.innerHTML='<option value="">不绑定套餐</option>'+ps.data.map(p=>'<option value="'+h(p.id)+'">'+h(p.name)+'</option>').join('');users.innerHTML=tbl(us.data,['email','name','status','plan_name','groups','used','expire','sub']);nodes.innerHTML=tbl(nodeRows,['id','name','address','port','host','path','group_id','default_user_quota_bytes','enabled','node_ops']);plans.innerHTML=tbl(ps.data,['id','name','quota_bytes','valid_days','device_limit','enabled']);groups.innerHTML=tbl(gs.data,['id','name']);sessions.innerHTML=tbl(ss.data,['id','email','node_name','status','upload','download','reason']);msg.textContent='数据已刷新';}catch(e){msg.textContent='错误：'+e.message}}
+t.value=localStorage.token||'';function save(){localStorage.token=t.value.trim();msg.textContent='Token 已保存'}function b(x){return (Number(x||0)/1073741824).toFixed(2)+' GB'}function gbv(x){let n=Number(x||0)/1073741824;return n?Number(n.toFixed(3)):0}function dt(x){return x?new Date(x*1000).toLocaleString():'永不过期'}
+async function loadAll(){try{msg.textContent='正在加载...';let s=await api('summary');sum.innerHTML=Object.entries(s.data).map(([k,v])=>'<div class=card><b>'+h(L[k]||k)+'</b><br>'+(/Bytes/.test(k)?b(v):h(v))+'</div>').join('');let [us,ns,ps,gs,ss]=await Promise.all([api('users'),api('nodes'),api('plans'),api('groups'),api('sessions')]);userRows=us.data||[];nodeRows=ns.data||[];uplan.innerHTML='<option value="">不绑定套餐</option>'+ps.data.map(p=>'<option value="'+h(p.id)+'">'+h(p.name)+'</option>').join('');fillLimitUsers();users.innerHTML=tbl(userRows,['email','name','status','plan_name','groups','used','expire','sub']);nodes.innerHTML=tbl(nodeRows,['id','name','address','port','host','path','group_id','default_user_quota_bytes','enabled','node_ops']);plans.innerHTML=tbl(ps.data,['id','name','quota_bytes','valid_days','device_limit','enabled']);groups.innerHTML=tbl(gs.data,['id','name']);sessions.innerHTML=tbl(ss.data,['id','email','node_name','status','upload','download','reason']);msg.textContent='数据已刷新';}catch(e){msg.textContent='错误：'+e.message}}
 function tbl(rows,cols){if(!rows||!rows.length)return '<p class=muted>暂无数据</p>';return '<table><tr>'+cols.map(c=>'<th>'+h(L[c]||c)+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+cell(r,c)+'</td>').join('')+'</tr>').join('')+'</table>'}
-function cell(r,c){if(c==='used')return b((r.used_upload||0)+(r.used_download||0))+' / '+b(r.quota_bytes||0);if(c==='expire')return dt(r.expires_at);if(c==='sub')return '<button onclick="copySub(\\''+r.sub_token+'\\')">复制订阅</button> <button onclick="resetU(\\''+r.id+'\\')">重置流量</button>';if(c==='node_ops')return '<span class=ops><button onclick="editNode(\\''+h(r.id)+'\\')">编辑</button><button onclick="toggleNode(\\''+h(r.id)+'\\','+(r.enabled?0:1)+')">'+(r.enabled?'禁用':'启用')+'</button><button onclick="copyPath(\\''+h(r.path||('/node/'+r.id))+'\\')">复制路径</button></span>';if(c==='upload')return b(r.upload_bytes);if(c==='download')return b(r.download_bytes);if(c==='reason')return h(r.close_reason||'');if(c==='enabled')return r.enabled?'<span class=ok>是</span>':'<span class=bad>否</span>';if(c==='default_user_quota_bytes')return r[c]?b(r[c]):'不限';return '<span class=mono>'+h(r[c]??'')+'</span>'}
+function cell(r,c){if(c==='used')return b((r.used_upload||0)+(r.used_download||0))+' / '+(r.quota_bytes?b(r.quota_bytes):'不限');if(c==='expire')return dt(r.expires_at);if(c==='sub'){let u=subUrl(r);return '<div class=mono>'+h(u)+'</div><p class=ops><button onclick="copySub(\\''+r.sub_token+'\\')">复制订阅</button><button onclick="selectLimitUser(\\''+r.id+'\\')">节点限额</button><button onclick="resetU(\\''+r.id+'\\')">重置流量</button></p>'}if(c==='node_ops')return '<span class=ops><button onclick="editNode(\\''+h(r.id)+'\\')">编辑</button><button onclick="toggleNode(\\''+h(r.id)+'\\','+(r.enabled?0:1)+')">'+(r.enabled?'禁用':'启用')+'</button><button onclick="copyPath(\\''+h(r.path||('/node/'+r.id))+'\\')">复制路径</button></span>';if(c==='upload')return b(r.upload_bytes);if(c==='download')return b(r.download_bytes);if(c==='reason')return h(r.close_reason||'');if(c==='enabled')return r.enabled?'<span class=ok>是</span>':'<span class=bad>否</span>';if(c==='default_user_quota_bytes'||c==='quota_bytes')return r[c]?b(r[c]):'不限';if(c==='valid_days')return Number(r[c]||0)?h(r[c]):'永不过期';return '<span class=mono>'+h(r[c]??'')+'</span>'}
+function subUrl(r){return location.origin+'/sub/'+r.sub_token}
 async function copySub(tok){let u=location.origin+'/sub/'+tok;await navigator.clipboard.writeText(u);msg.textContent='订阅链接已复制：'+u}
 async function resetU(id){await api('users/'+id+'/reset-usage',{method:'POST'});msg.textContent='流量已重置';loadAll()}
-async function createUser(){await api('users',{method:'POST',body:JSON.stringify({email:uemail.value,name:uname.value,plan_id:uplan.value,group_ids:ugroups.value.split(',').map(x=>x.trim()).filter(Boolean),quota_bytes:uq.value||undefined,expires_at:uexp.value||undefined,device_limit:udev.value||undefined})});msg.textContent='用户已创建';loadAll()}
-function nodeBody(){let id=safeId(nid.value||nname.value||naddr.value);nid.value=id;let host=(nhost.value||DH).trim();return{id,name:nname.value||id,address:naddr.value.trim(),port:Number(nport.value||443),host,sni:host,path:npath.value||('/node/'+id),group_id:ngroup.value||'default',default_user_quota_bytes:Number(nquota.value||0),sort_order:Number(nsort.value||0),enabled:Number(nenabled.value)}} 
+async function createUser(){await api('users',{method:'POST',body:JSON.stringify({email:uemail.value,name:uname.value,plan_id:uplan.value,group_ids:ugroups.value.split(',').map(x=>x.trim()).filter(Boolean),quota_gb:uq.value||undefined,valid_days:udays.value===''?undefined:udays.value,device_limit:udev.value||undefined})});msg.textContent='用户已创建';loadAll()}
+function fillLimitUsers(){limitUser.innerHTML=userRows.map(u=>'<option value="'+h(u.id)+'">'+h((u.email||u.name||u.id)+' ｜ '+u.id)+'</option>').join('');if(!limitRows.length)nodeLimits.innerHTML='<p class=muted>请选择用户后加载节点限额。</p>'}
+async function selectLimitUser(id){limitUser.value=id;await loadNodeLimits();document.getElementById('nodeLimits').scrollIntoView({behavior:'smooth',block:'start'})}
+async function loadNodeLimits(){let id=limitUser.value;if(!id)return msg.textContent='请先创建或选择用户';let res=await api('users/'+id+'/node-limits');limitRows=res.data||[];nodeLimits.innerHTML=limitRows.length?nodeLimitTable(limitRows):'<p class=muted>暂无节点。</p>';msg.textContent='已加载该用户的节点限额'}
+async function saveNodeLimits(){let id=limitUser.value;if(!id)return msg.textContent='请先选择用户';let limits=limitRows.map(r=>({node_id:r.node_id,quota_gb:$(limId(r.node_id)).value||0,status:$('st_'+limId(r.node_id)).value||'active'}));await api('users/'+id+'/node-limits',{method:'PATCH',body:JSON.stringify({limits})});msg.textContent='用户节点限额已保存';loadNodeLimits()}
+function nodeLimitCell(r,c){if(c==='quota_limit')return '<input id="'+limId(r.node_id)+'" value="'+gbv(r.quota_bytes)+'" placeholder="GB，0 不限">';if(c==='node_used')return b((r.used_upload||0)+(r.used_download||0));if(c==='status')return '<select id="st_'+limId(r.node_id)+'"><option value=active '+(r.status==='active'?'selected':'')+'>启用</option><option value=disabled '+(r.status==='disabled'?'selected':'')+'>禁用</option></select>';return '<span class=mono>'+h(r[c]??'')+'</span>'}
+function nodeLimitTable(rows){let cols=['node_id','node_name','quota_limit','node_used','status'];return '<table><tr>'+cols.map(c=>'<th>'+h(L[c]||c)+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+nodeLimitCell(r,c)+'</td>').join('')+'</tr>').join('')+'</table>'}
+function limId(v){return 'lim_'+String(v).replace(/[^a-zA-Z0-9_-]/g,'_')}
+function nodeBody(){let id=safeId(nid.value||nname.value||naddr.value);nid.value=id;let host=(nhost.value||DH).trim();return{id,name:nname.value||id,address:naddr.value.trim(),port:Number(nport.value||443),host,sni:host,path:npath.value||('/node/'+id),group_id:ngroup.value||'default',default_user_quota_gb:Number(nquota.value||0),sort_order:Number(nsort.value||0),enabled:Number(nenabled.value)}} 
 async function saveNode(){let b=nodeBody();if(!b.id||!b.address)throwMsg('节点 ID 和入口地址不能为空');if(editingNode){await api('nodes/'+editingNode,{method:'PATCH',body:JSON.stringify(b)});msg.textContent='节点已更新'}else{await api('nodes',{method:'POST',body:JSON.stringify(b)});msg.textContent='节点已创建'}resetNodeForm();loadAll()}
-function editNode(id){let r=nodeRows.find(x=>x.id===id);if(!r)return;nid.value=r.id;nname.value=r.name||'';naddr.value=r.address||'';nport.value=r.port||443;nhost.value=r.host||DH;ngroup.value=r.group_id||'default';npath.value=r.path||('/node/'+r.id);nquota.value=r.default_user_quota_bytes||0;nsort.value=r.sort_order||0;nenabled.value=r.enabled?1:0;editingNode=id;nsave.textContent='保存修改';msg.textContent='正在编辑节点：'+id;scrollTo({top:0,behavior:'smooth'})}
+function editNode(id){let r=nodeRows.find(x=>x.id===id);if(!r)return;nid.value=r.id;nname.value=r.name||'';naddr.value=r.address||'';nport.value=r.port||443;nhost.value=r.host||DH;ngroup.value=r.group_id||'default';npath.value=r.path||('/node/'+r.id);nquota.value=gbv(r.default_user_quota_bytes);nsort.value=r.sort_order||0;nenabled.value=r.enabled?1:0;editingNode=id;nsave.textContent='保存修改';msg.textContent='正在编辑节点：'+id;scrollTo({top:0,behavior:'smooth'})}
 function resetNodeForm(){editingNode='';for(const x of [nid,nname,naddr,nport,nhost,ngroup,npath,nquota,nsort])x.value='';nenabled.value=1;nsave.textContent='保存节点'}
 async function toggleNode(id,en){await api('nodes/'+id,{method:'PATCH',body:JSON.stringify({enabled:en})});msg.textContent=en?'节点已启用':'节点已禁用';loadAll()}
 async function copyPath(p){await navigator.clipboard.writeText(p);msg.textContent='节点路径已复制：'+p}
 async function importNodes(){let lines=nbulk.value.replace(/\\r/g,'').split('\\n').map(x=>x.trim()).filter(Boolean);let ok=0;for(const line of lines){let n=parseNodeLine(line,ok+1);if(!n)continue;try{let exists=nodeRows.some(x=>x.id===n.id);await api(exists?('nodes/'+n.id):'nodes',{method:exists?'PATCH':'POST',body:JSON.stringify(n)});ok++}catch(e){msg.textContent='导入失败：'+line+' '+e.message;return}}msg.textContent='已导入 '+ok+' 个节点';nbulk.value='';loadAll()}
-function parseNodeLine(line,i){let a=line.split(',').map(x=>x.trim());let id='',addr='',name='',group='default',quota=0;if(a.length>=3){id=safeId(a[0]);addr=a[1];name=a[2];group=a[3]||'default';quota=Number(a[4]||0)}else{let h=line.indexOf('#');addr=(h>=0?line.slice(0,h):line).trim();name=(h>=0?line.slice(h+1):'自定义节点-'+i).trim();id=safeId(name||addr)}let p=parseAddr(addr),host=DH;return p.address?{id,name:name||id,address:p.address,port:p.port||443,host,sni:host,path:'/node/'+id,group_id:group||'default',default_user_quota_bytes:quota,sort_order:50+i,enabled:1}:null}
+function parseNodeLine(line,i){let a=line.split(',').map(x=>x.trim());let id='',addr='',name='',group='default',quota=0;if(a.length>=3){id=safeId(a[0]);addr=a[1];name=a[2];group=a[3]||'default';quota=Number(a[4]||0)}else{let h=line.indexOf('#');addr=(h>=0?line.slice(0,h):line).trim();name=(h>=0?line.slice(h+1):'自定义节点-'+i).trim();id=safeId(name||addr)}let p=parseAddr(addr),host=DH;return p.address?{id,name:name||id,address:p.address,port:p.port||443,host,sni:host,path:'/node/'+id,group_id:group||'default',default_user_quota_gb:quota,sort_order:50+i,enabled:1}:null}
 function parseAddr(v){if(!v)return{};if(v[0]=='['){let m=v.match(/^\\[([^\\]]+)\\](?::(\\d+))?$/);if(m)return{address:m[1],port:Number(m[2]||443)}}let i=v.lastIndexOf(':');return i>0&&/^\\d+$/.test(v.slice(i+1))?{address:v.slice(0,i),port:Number(v.slice(i+1))}:{address:v,port:443}}
 function safeId(v){return String(v||'node').toLowerCase().replace(/[^a-z0-9_.-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,48)||('node-'+Date.now())}
 function throwMsg(t){msg.textContent=t;throw new Error(t)}
-async function createPlan(){let id=pname.value.toLowerCase().replace(/[^a-z0-9]+/g,'-')||('plan-'+Date.now());await api('plans',{method:'POST',body:JSON.stringify({id,name:pname.value,quota_bytes:pquota.value||0,valid_days:pdays.value||30})});msg.textContent='套餐已创建';loadAll()}
+async function createPlan(){let id=pname.value.toLowerCase().replace(/[^a-z0-9]+/g,'-')||('plan-'+Date.now());await api('plans',{method:'POST',body:JSON.stringify({id,name:pname.value,quota_gb:pquota.value||0,valid_days:pdays.value||0})});msg.textContent='套餐已创建';loadAll()}
 async function createGroup(){let id=gname.value.toLowerCase().replace(/[^a-z0-9]+/g,'-')||('group-'+Date.now());await api('groups',{method:'POST',body:JSON.stringify({id,name:gname.value})});msg.textContent='分组已创建';loadAll()}
 async function boot(){let proxy=prompt('请输入代理 Worker 域名，例如 proxy.example.com');if(!proxy)return;await api('bootstrap',{method:'POST',body:JSON.stringify({proxy_host:proxy,create_demo_user:true})});msg.textContent='默认数据已初始化';loadAll()}
 function h(v){return String(v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
