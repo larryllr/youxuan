@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-vless-manager",
+  "main": "manager-worker.js",
+  "compatibility_date": "2026-05-28",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "PROXY_HOST": "replace-with-your-snippets-worker.workers.dev"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cf-vless-manager",
+      "database_id": "replace-with-d1-database-id"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USAGE_METER",
+        "class_name": "UsageMeter"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "UsageMeter"
+      ]
+    }
+  ]
+}
