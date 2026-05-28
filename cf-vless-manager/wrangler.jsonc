@@ -7,7 +7,7 @@
     "enabled": true
   },
   "vars": {
-    "PROXY_HOST": "snippets-v2rayng-managed-us.2089151168.workers.dev"
+    "PROXY_HOST": "111.freelx.net"
   },
   "d1_databases": [
     {
