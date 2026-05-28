@@ -19,11 +19,13 @@ const maxGitHubPreferredNodes = 12;
 const enableOtherPreferred = true;
 // API地址配置（订阅转换服务）
 const apiBaseUrl = 'https://url.v1.mk/sub';
+// ECH配置：默认关闭，避免客户端ECH兼容性影响测速和连接
+const echConfigList = 'godotengine.org+https://dns.alidns.com/dns-query';
+const addECHNodes = false;
+const forceECHOnly = false;
 // 平板/部分Android设备更稳：关闭WS early data，使用固定Chrome指纹
 const stableWsPath = '/';
 const tlsFingerprint = 'chrome';
-const TCP_TIMEOUT = 8000, FIRST_BYTE_TIMEOUT = 3500, RACE_DELAY = 180;
-const T_CHUNK = 64 * 1024, UP_PACK = 16 * 1024, UP_MAX = 256 * 1024;
 
 const directDomains = [
   { name: "cloudflare.182682.xyz", domain: "cloudflare.182682.xyz" },
@@ -204,7 +206,8 @@ export default {
         return await handleWsRequest(request, currentFallbackAddress);
       } else if (request.method === 'GET') {
         if (url.pathname === '/') {
-          return new Response('ok', { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+          const successHtml = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>服务正常</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background-color:#121212;color:#e0e0e0;text-align:center;}.container{padding:2rem;border-radius:8px;background-color:#1e1e1e;box-shadow:0 4px 6px rgba(0,0,0,0.1);}h1{color:#4caf50;}</style></head><body><div class="container"><h1>✅ 服务正常</h1><p>请继续后面的操作。</p></div></body></html>`;
+          return new Response(successHtml, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         }
 
         if (customPath && customPath.trim()) {
@@ -223,7 +226,13 @@ export default {
           if (url.pathname.length > 1 && url.pathname !== '/') {
             const user = url.pathname.replace(/\/$/, '').replace('/sub', '').substring(1);
             if (isValidFormat(user)) {
-              return new Response('Forbidden', { status: 403 });
+              return new Response(JSON.stringify({
+                error: '访问被拒绝',
+                message: '当前 Worker 已启用自定义路径模式，UUID 访问已禁用'
+              }), {
+                status: 403,
+                headers: { 'Content-Type': 'application/json; charset=utf-8' }
+              });
             }
           }
         } else {
@@ -263,7 +272,7 @@ async function handleSubscriptionPage(request, uuid = null) {
   const u = new URL(request.url);
   const base = u.origin + u.pathname.replace(/\/+$/, '');
   const subUrl = base + '/sub';
-  const pageHtml = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>sub</title><style>body{font-family:Arial;background:#111;color:#eee;padding:18px}textarea{width:100%;height:140px;box-sizing:border-box;background:#000;color:#0f0;border:1px solid #333;padding:10px}button{margin:8px 6px 0 0;padding:9px 12px;background:#222;color:#0f0;border:1px solid #0f0}pre{white-space:pre-wrap;word-break:break-all;background:#000;padding:10px}</style><h3>订阅</h3><textarea id=i placeholder="104.17.147.116:443#自定义-1&#10;104.19.146.223:443#自定义-2"></textarea><br><button onclick=o()>打开订阅</button><button onclick=s()>保存IP</button><button onclick=c(b)>复制原版</button><button onclick="s();c(m())">复制带IP</button><button onclick="localStorage.removeItem(k);i.value='';p()">清空</button><pre id=r></pre><script>const b=${JSON.stringify(subUrl)},k='cf_ips',i=document.getElementById('i'),r=document.getElementById('r');i.value=localStorage.getItem(k)||'';function v(){return i.value.replace(/\\r/g,'').split(/\\n|,/).map(x=>x.trim()).filter(Boolean).join(',')}function m(){let x=v();return x?b+'?ips='+encodeURIComponent(x):b}function p(){r.textContent='原版:\\n'+b+'\\n\\n带IP:\\n'+m()}function s(){localStorage.setItem(k,i.value);p()}function o(){location.href=m()}function c(t){navigator.clipboard?navigator.clipboard.writeText(t):prompt('复制',t);r.textContent='已复制\\n'+t}i.oninput=p;p()</script>`;
+  const pageHtml = `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>订阅中心</title><style>body{font-family:Arial;background:#111;color:#eee;padding:22px}textarea{width:100%;height:150px;box-sizing:border-box;background:#000;color:#0f0;border:1px solid #0f0;padding:10px}button{padding:10px 14px;margin:8px 8px 0 0;background:#222;color:#0f0;border:1px solid #0f0}pre{white-space:pre-wrap;word-break:break-all;background:#000;color:#0f0;padding:12px;border:1px solid #333}.tip{color:#aaa}</style></head><body><h2>订阅中心</h2><p class="tip">默认订阅保持原版输出；填写并保存IP后，复制带IP订阅链接会追加这些IP。无JS时可直接提交表单打开订阅。</p><form id="f" action="${subUrl}" method="get" target="_blank"><textarea id="ips" name="ips" placeholder="104.17.147.116:443#自定义-1&#10;104.19.146.223:443#自定义-2"></textarea><br><button type="submit">打开订阅/无JS兜底</button><button type="button" id="saveBtn">保存IP</button><button type="button" id="copyOriginBtn">复制原版订阅链接</button><button type="button" id="copyIpBtn">复制带IP订阅链接</button><button type="button" id="clearBtn">清空保存</button></form><pre id="out"></pre><script>(function(){var base=${JSON.stringify(subUrl)};var key='cf_saved_ips_v2';var nl=String.fromCharCode(10);var cr=String.fromCharCode(13);var ta=document.getElementById('ips');var out=document.getElementById('out');function clean(){var raw=(ta.value||'').split(cr).join('');var arr=raw.split(nl);var r=[];for(var i=0;i<arr.length;i++){var x=arr[i].trim();if(x)r.push(x)}return r.join(',')}function makeUrl(){var v=clean();return v?base+'?ips='+encodeURIComponent(v):base}function show(t){out.textContent=t}function save(){try{localStorage.setItem(key,ta.value||'')}catch(e){}show('已保存IP'+nl+makeUrl())}function copyText(t){if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){show('已复制'+nl+t)},function(){fallbackCopy(t)})}else{fallbackCopy(t)}}function fallbackCopy(t){var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();try{document.execCommand('copy');show('已复制'+nl+t)}catch(e){prompt('请手动复制',t)}document.body.removeChild(a)}try{ta.value=localStorage.getItem(key)||''}catch(e){}show('原版订阅：'+nl+base+nl+nl+'带IP订阅：'+nl+makeUrl());document.getElementById('saveBtn').addEventListener('click',save);document.getElementById('copyOriginBtn').addEventListener('click',function(){copyText(base)});document.getElementById('copyIpBtn').addEventListener('click',function(){save();copyText(makeUrl())});document.getElementById('clearBtn').addEventListener('click',function(){try{localStorage.removeItem(key)}catch(e){}ta.value='';show('已清空'+nl+base)});ta.addEventListener('input',function(){show('带IP订阅：'+nl+makeUrl())});})();</script></body></html>`;
   return new Response(pageHtml, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
@@ -330,7 +339,8 @@ function generateLinksFromSource(list, uuid, workerDomain) {
 async function fetchAndParseNewIPs() {
   const url = githubPreferredURL;
   try {
-    const response = await fetch(url);
+    const c=new AbortController,t=setTimeout(()=>c.abort(),1800);
+    const response=await fetch(url,{signal:c.signal}).finally(()=>clearTimeout(t));
     if (!response.ok) return [];
     const text = await response.text();
     const results = [];
@@ -371,10 +381,13 @@ function generateLinksFromNewIPs(list, uuid, workerDomain) {
 }
 
 function pushWsLinks(links, proto, uuid, safeIP, port, workerDomain, wsPath, nodeName) {
-  links.push(buildWsLink(proto, uuid, safeIP, port, workerDomain, wsPath, nodeName));
+  if (!forceECHOnly) links.push(buildWsLink(proto, uuid, safeIP, port, workerDomain, wsPath, nodeName));
+  if ((addECHNodes || forceECHOnly) && echConfigList.trim()) {
+    links.push(buildWsLink(proto, uuid, safeIP, port, workerDomain, wsPath, `${nodeName}-ECH`, echConfigList.trim()));
+  }
 }
 
-function buildWsLink(proto, uuid, safeIP, port, workerDomain, wsPath, nodeName) {
+function buildWsLink(proto, uuid, safeIP, port, workerDomain, wsPath, nodeName, ech = '') {
   const wsParams = new URLSearchParams({
     encryption: 'none',
     security: 'tls',
@@ -384,6 +397,7 @@ function buildWsLink(proto, uuid, safeIP, port, workerDomain, wsPath, nodeName) 
     host: workerDomain,
     path: wsPath
   });
+  if (ech) wsParams.set('ech', ech);
   return `${proto}://${uuid}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(nodeName)}`;
 }
 
@@ -391,68 +405,27 @@ async function handleWsRequest(request, currentFallbackAddress = null) {
   const wsPair = new WebSocketPair();
   const [clientSock, serverSock] = Object.values(wsPair);
   serverSock.accept();
-  serverSock.binaryType = 'arraybuffer';
 
-  let remoteConnWrapper = { socket: null, writer: null, drain: null };
-  let isDnsQuery = false, uploadBusy = false, transportClosed = false;
-  const uploadQueue = createChunkQueue(UP_PACK, UP_MAX);
+  let remoteConnWrapper = { socket: null };
+  let isDnsQuery = false;
 
   const fbAddr = currentFallbackAddress || fallbackAddress;
-
-  function releaseRemoteWriter() {
-    try { remoteConnWrapper.writer?.releaseLock(); } catch (error) { }
-    remoteConnWrapper.writer = null;
-  }
-
-  function closeTransport() {
-    if (transportClosed) return;
-    transportClosed = true;
-    uploadQueue.clear();
-    releaseRemoteWriter();
-    closeSocketQuietly(remoteConnWrapper.socket);
-    closeSocketQuietly(serverSock);
-  }
-
-  function queueUpload(chunk) {
-    if (!uploadQueue.push(chunk)) {
-      closeTransport();
-      return false;
-    }
-    remoteConnWrapper.drain?.();
-    return true;
-  }
-
-  async function drainUpload() {
-    if (uploadBusy || transportClosed || !remoteConnWrapper.writer) return;
-    uploadBusy = true;
-    try {
-      for (;;) {
-        if (transportClosed || !remoteConnWrapper.writer) break;
-        const data = uploadQueue.take();
-        if (!data) break;
-        await remoteConnWrapper.writer.write(data);
-      }
-    } catch (error) {
-      closeTransport();
-    } finally {
-      uploadBusy = false;
-      if (!uploadQueue.empty && !transportClosed && remoteConnWrapper.writer) queueMicrotask(drainUpload);
-    }
-  }
-
-  remoteConnWrapper.drain = () => {
-    if (!uploadBusy && !uploadQueue.empty && remoteConnWrapper.writer) queueMicrotask(drainUpload);
-  };
 
   const earlyData = request.headers.get('sec-websocket-protocol') || '';
   const readable = makeReadableStream(serverSock, earlyData);
 
   readable.pipeTo(new WritableStream({
     async write(chunk) {
-      if (transportClosed) return;
       if (isDnsQuery) return await forwardUDP(chunk, serverSock, null);
-      if (remoteConnWrapper.socket && remoteConnWrapper.writer) {
-        if (!queueUpload(chunk)) throw new Error('upload queue overflow');
+      if (remoteConnWrapper.socket) {
+        try {
+          await writeToSocket(remoteConnWrapper.socket, chunk);
+        } catch (err) {
+          closeSocketQuietly(remoteConnWrapper.socket);
+          remoteConnWrapper.socket = null;
+          closeSocketQuietly(serverSock);
+          throw err;
+        }
         return;
       }
       const { hasError, message, addressType, port, hostname, rawIndex, version, isUDP } = parseWsPacketHeader(chunk, authToken);
@@ -468,7 +441,7 @@ async function handleWsRequest(request, currentFallbackAddress = null) {
       if (isDnsQuery) return forwardUDP(rawData, serverSock, respHeader);
       await forwardTCP(addressType, hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, fbAddr);
     },
-  })).catch((err) => { console.log('WS Stream Error:', err); closeTransport(); });
+  })).catch((err) => { console.log('WS Stream Error:', err); });
 
   return new Response(null, { status: 101, webSocket: clientSock });
 }
@@ -476,59 +449,34 @@ async function handleWsRequest(request, currentFallbackAddress = null) {
 async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remoteConnWrapper, fbAddr = null) {
   let retried = false;
 
-  async function getFallbackTarget() {
-    if (fbAddr && fbAddr.trim()) {
-      const parsed = parseAddressAndPort(fbAddr);
-      return { host: parsed.address, port: parsed.port || portNum };
-    }
-    if (fallbackAddress && fallbackAddress.trim()) {
-      const parsed = parseAddressAndPort(fallbackAddress);
-      return { host: parsed.address, port: parsed.port || portNum };
-    }
-    const bestBackupIP = await getBestBackupIP(currentWorkerRegion);
-    return bestBackupIP ? { host: bestBackupIP.domain, port: bestBackupIP.port } : { host, port: portNum };
-  }
-
-  async function connectAndSend(address, port, fallbackTarget = null) {
-    const primary = { host: address, port };
-    const shouldRace = fallbackTarget && (fallbackTarget.host !== address || fallbackTarget.port !== port);
-    const remoteSock = shouldRace ? await raceTcpSocket(primary, fallbackTarget) : await connectTcpSocket(address, port);
-    const writer = remoteSock.writable.getWriter();
-    try {
-      if (rawData.byteLength) await writer.write(toUint8Array(rawData));
-      return { remoteSock, writer };
-    } catch (error) {
-      try { writer.releaseLock(); } catch (e) { }
-      closeSocketQuietly(remoteSock);
-      throw error;
-    }
-  }
-
-  function attachRemote(remoteSock, writer, retryFunc) {
-    try {
-      if (remoteConnWrapper.writer && remoteConnWrapper.writer !== writer) remoteConnWrapper.writer.releaseLock();
-    } catch (error) { }
-    remoteConnWrapper.socket = remoteSock;
-    remoteConnWrapper.writer = writer;
-    remoteConnWrapper.drain?.();
-    remoteSock.closed.catch(() => { }).finally(() => {
-      if (remoteConnWrapper.socket === remoteSock && (!retryFunc || !retried)) closeSocketQuietly(ws);
-    });
-    void connectStreams(remoteSock, ws, respHeader, retryFunc).finally(() => {
-      if (remoteConnWrapper.socket === remoteSock) {
-        try { writer.releaseLock(); } catch (error) { }
-        remoteConnWrapper.writer = null;
-      }
-    });
+  async function connectAndSend(address, port) {
+    const remoteSock = connect({ hostname: address, port: port });
+    await writeToSocket(remoteSock, rawData);
+    return remoteSock;
   }
 
   async function retryConnection() {
     if (retried || ws.readyState !== 1) return;
     retried = true;
-    const fallbackTarget = await getFallbackTarget();
+    let fallbackHost, fallbackPort;
+    if (fbAddr && fbAddr.trim()) {
+      const parsed = parseAddressAndPort(fbAddr);
+      fallbackHost = parsed.address;
+      fallbackPort = parsed.port || portNum;
+    } else if (fallbackAddress && fallbackAddress.trim()) {
+      const parsed = parseAddressAndPort(fallbackAddress);
+      fallbackHost = parsed.address;
+      fallbackPort = parsed.port || portNum;
+    } else {
+      const bestBackupIP = await getBestBackupIP(currentWorkerRegion);
+      fallbackHost = bestBackupIP ? bestBackupIP.domain : host;
+      fallbackPort = bestBackupIP ? bestBackupIP.port : portNum;
+    }
     try {
-      const { remoteSock, writer } = await connectAndSend(fallbackTarget.host || host, fallbackTarget.port);
-      attachRemote(remoteSock, writer, null);
+      const newSocket = await connectAndSend(fallbackHost || host, fallbackPort);
+      remoteConnWrapper.socket = newSocket;
+      newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
+      connectStreams(newSocket, ws, respHeader, null);
     } catch (err) {
       console.log('Fallback connection failed:', err);
       closeSocketQuietly(ws);
@@ -536,9 +484,9 @@ async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remo
   }
 
   try {
-    const fallbackTarget = await getFallbackTarget();
-    const { remoteSock, writer } = await connectAndSend(host, portNum, fallbackTarget);
-    attachRemote(remoteSock, writer, retryConnection);
+    const initialSocket = await connectAndSend(host, portNum);
+    remoteConnWrapper.socket = initialSocket;
+    connectStreams(initialSocket, ws, respHeader, retryConnection);
   } catch (err) {
     console.log('Initial connection failed, trying fallback:', err);
     await retryConnection();
@@ -602,57 +550,35 @@ function makeReadableStream(socket, earlyDataHeader) {
 }
 
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
-  let header = headerData, hasData = false, retried = false, reader = null, byob = true;
-  let timer = retryFunc ? setTimeout(() => {
-    if (!hasData && !retried) {
-      retried = true;
-      closeSocketQuietly(remoteSocket);
-      void retryFunc();
-    }
-  }, FIRST_BYTE_TIMEOUT) : null;
-  try {
-    try {
-      reader = remoteSocket.readable.getReader({ mode: 'byob' });
-    } catch (error) {
-      byob = false;
-      reader = remoteSocket.readable.getReader();
-    }
-    for (;;) {
-      const result = byob ? await reader.read(new Uint8Array(T_CHUNK)) : await reader.read();
-      if (result.done) break;
-      const chunk = toUint8Array(result.value);
-      if (!chunk.byteLength) continue;
-      if (!hasData) {
+  let header = headerData, hasData = false;
+  await remoteSocket.readable.pipeTo(
+    new WritableStream({
+      async write(chunk, controller) {
         hasData = true;
-        if (timer) { clearTimeout(timer); timer = null; }
-      }
-      if (webSocket.readyState !== 1) throw new Error(E_WS_NOT_OPEN);
-      if (header) {
-        webSocket.send(await new Blob([header, chunk]).arrayBuffer());
-        header = null;
-      } else {
-        webSocket.send(chunk);
-      }
-    }
-  } catch (error) {
+        if (webSocket.readyState !== 1) {
+          controller.error(E_WS_NOT_OPEN);
+          return;
+        }
+        if (header) {
+          webSocket.send(await new Blob([header, chunk]).arrayBuffer());
+          header = null;
+        } else {
+          webSocket.send(chunk);
+        }
+      },
+      abort(reason) { console.error("Readable aborted:", reason); },
+    })
+  ).catch((error) => {
     console.error("Stream connection error:", error);
-    if (!hasData && retryFunc && !retried && webSocket.readyState === 1) {
-      retried = true;
-      await retryFunc();
-      return;
-    }
     if (hasData || !retryFunc || webSocket.readyState !== 1) closeSocketQuietly(webSocket);
-  } finally {
-    if (timer) clearTimeout(timer);
-    try { reader?.releaseLock(); } catch (error) { }
-  }
+  });
 
-  if (!hasData && retryFunc && !retried && webSocket.readyState === 1) await retryFunc();
+  if (!hasData && retryFunc && webSocket.readyState === 1) await retryFunc();
 }
 
 async function forwardUDP(udpChunk, webSocket, respHeader) {
   try {
-    const tcpSocket = await connectTcpSocket('8.8.4.4', 53);
+    const tcpSocket = connect({ hostname: '8.8.4.4', port: 53 });
     let vlessHeader = respHeader;
     await writeToSocket(tcpSocket, udpChunk);
     await tcpSocket.readable.pipeTo(new WritableStream({
@@ -686,94 +612,10 @@ async function writeToSocket(socket, chunk) {
   if (!socket || !chunk || chunk.byteLength === 0) return;
   const writer = socket.writable.getWriter();
   try {
-    await writer.write(toUint8Array(chunk));
+    await writer.write(chunk);
   } finally {
     try { writer.releaseLock(); } catch (error) { }
   }
-}
-
-async function connectTcpSocket(hostname, port) {
-  const socket = connect({ hostname, port });
-  try {
-    await withTimeout(socket.opened, TCP_TIMEOUT, 'TCP connect timeout');
-    return socket;
-  } catch (error) {
-    closeSocketQuietly(socket);
-    throw error;
-  }
-}
-
-function raceTcpSocket(primary, backup) {
-  let done = false, fail = 0, timer;
-  return new Promise((resolve, reject) => {
-    const start = (target) => connectTcpSocket(target.host, target.port).then(socket => {
-      if (done) return closeSocketQuietly(socket);
-      done = true;
-      clearTimeout(timer);
-      resolve(socket);
-    }, error => {
-      if (++fail >= 2 && !done) reject(error);
-    });
-    start(primary);
-    timer = setTimeout(() => start(backup), RACE_DELAY);
-  });
-}
-
-function withTimeout(promise, ms, message) {
-  let timer;
-  return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
-    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })
-  ]);
-}
-
-function createChunkQueue(pack, max) {
-  let queue = [], head = 0, size = 0;
-  return {
-    get empty() { return size === 0; },
-    clear() { queue = []; head = 0; size = 0; },
-    push(chunk) {
-      const data = toUint8Array(chunk);
-      if (!data.byteLength) return true;
-      if (size + data.byteLength > max) return false;
-      for (let i = 0; i < data.byteLength; i += pack) queue.push(data.subarray(i, i + pack));
-      size += data.byteLength;
-      return true;
-    },
-    take() {
-      if (head >= queue.length) return null;
-      const chunks = [];
-      let len = 0;
-      while (head < queue.length && len < pack) {
-        const data = queue[head++];
-        chunks.push(data);
-        len += data.byteLength;
-        size -= data.byteLength;
-      }
-      if (head > 64 && head * 2 > queue.length) {
-        queue = queue.slice(head);
-        head = 0;
-      }
-      return joinChunks(chunks, len);
-    }
-  };
-}
-
-function joinChunks(chunks, len) {
-  if (chunks.length === 1) return chunks[0];
-  const out = new Uint8Array(len);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
-}
-
-function toUint8Array(value) {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 }
 
 function isValidFormat(uuid) {
