@@ -5,6 +5,7 @@
 const H_JSON = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 const H_TEXT = { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' };
 const DAY = 86400;
+const TZ_OFFSET = 8 * 3600;
 
 export default {
   async fetch(request, env) {
@@ -21,6 +22,9 @@ export default {
     } catch (err) {
       return json({ ok: false, error: String(err?.message || err) }, 500);
     }
+  },
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(resetDueUsers(env));
   },
 };
 
@@ -48,7 +52,7 @@ export class UsageMeter {
     const uuid = String(data.uuid || '').toLowerCase();
     const nodeId = nodeIdOf(data.nodeId || data.node || 'default');
     const sessionId = data.sessionId || rid('sess');
-    const user = await userByUuid(this.env, uuid);
+    const user = await maybeResetUser(this.env, await userByUuid(this.env, uuid), now);
     const node = await getNodeForAccess(this.env, nodeId);
     const access = await checkAccess(this.env, user, node, now);
     if (!access.ok) return access;
@@ -99,7 +103,7 @@ export class UsageMeter {
     const session = await first(this.env.DB, "SELECT * FROM sessions WHERE id=?", sessionId);
     if (!session || session.closed_at) return { ok: false, cut: true, error: 'session_closed' };
 
-    const user = await first(this.env.DB, "SELECT * FROM users WHERE id=?", session.user_id);
+    const user = await maybeResetUser(this.env, await first(this.env.DB, "SELECT * FROM users WHERE id=?", session.user_id), now);
     const node = await getNodeForAccess(this.env, session.node_id || 'default');
     const access = await checkAccess(this.env, user, node, now, false);
     if (!access.ok) {
@@ -160,8 +164,8 @@ async function handleEdge(request, env) {
 async function handleSubscription(request, env) {
   const url = new URL(request.url);
   const token = decodeURIComponent(url.pathname.replace(/^\/sub\//, '').split('/')[0] || '');
-  const user = await first(env.DB, "SELECT * FROM users WHERE sub_token=?", token);
   const now = unix();
+  const user = await maybeResetUser(env, await first(env.DB, "SELECT * FROM users WHERE sub_token=?", token), now);
   const state = await checkUserOnly(user, now);
   if (!state.ok) return new Response(state.error, { status: 403, headers: H_TEXT });
 
@@ -185,6 +189,7 @@ async function handleSubscription(request, env) {
 }
 
 async function handleAdmin(request, env) {
+  await resetDueUsers(env);
   const url = new URL(request.url);
   const parts = url.pathname.replace(/^\/api\/admin\/?/, '').split('/').filter(Boolean);
   const resource = parts[0] || 'summary';
@@ -226,16 +231,17 @@ async function usersApi(request, env, id, action) {
       plan_id: b.plan_id || null,
       quota_bytes: quotaValue(b, plan?.quota_bytes || 0),
       expires_at: validDays !== null ? daysToExpiry(validDays, now) : (toEpoch(b.expires_at) || daysToExpiry(plan?.valid_days || 0, now)),
+      next_reset_at: monthlyPlan(plan) ? nextMonthlyReset(now, plan.reset_day) : 0,
       device_limit: numOr(b.device_limit, plan?.device_limit || 0),
       speed_limit_bps: numOr(b.speed_limit_bps, plan?.speed_limit_bps || 0),
       status: b.status || 'active',
       note: b.note || '',
     };
     await env.DB.prepare(
-      "INSERT INTO users(id,email,name,uuid,sub_token,plan_id,quota_bytes,expires_at,device_limit,speed_limit_bps,status,note,created_at,updated_at) " +
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+      "INSERT INTO users(id,email,name,uuid,sub_token,plan_id,quota_bytes,expires_at,next_reset_at,device_limit,speed_limit_bps,status,note,created_at,updated_at) " +
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     ).bind(user.id, user.email, user.name, user.uuid, user.sub_token, user.plan_id, user.quota_bytes, user.expires_at,
-      user.device_limit, user.speed_limit_bps, user.status, user.note, now, now).run();
+      user.next_reset_at, user.device_limit, user.speed_limit_bps, user.status, user.note, now, now).run();
     await setUserGroups(env, user.id, b.group_ids || []);
     return json({ ok: true, data: await userDetail(env, user.id) }, 201);
   }
@@ -246,9 +252,10 @@ async function usersApi(request, env, id, action) {
     const b = await readJson(request);
     if ('quota_gb' in b) b.quota_bytes = gbToBytes(b.quota_gb);
     if ('valid_days' in b) b.expires_at = daysToExpiry(b.valid_days, unix());
-    const allowed = ['email', 'name', 'uuid', 'sub_token', 'plan_id', 'quota_bytes', 'expires_at', 'device_limit', 'speed_limit_bps', 'status', 'note'];
+    const allowed = ['email', 'name', 'uuid', 'sub_token', 'plan_id', 'quota_bytes', 'expires_at', 'next_reset_at', 'device_limit', 'speed_limit_bps', 'status', 'note'];
     await patchRow(env, 'users', id, allowed, b);
     if (Array.isArray(b.group_ids)) await setUserGroups(env, id, b.group_ids);
+    await refreshUserResetSchedule(env, id);
     return json({ ok: true, data: await userDetail(env, id) });
   }
 
@@ -303,6 +310,7 @@ async function tableApi(request, env, table, id, allowed, defaults) {
     const fields = allowed.filter(k => b[k] !== undefined);
     await env.DB.prepare(`INSERT INTO ${table}(${fields.join(',')}) VALUES(${fields.map(() => '?').join(',')})`)
       .bind(...fields.map(k => dbVal(k, b[k]))).run();
+    if (table === 'plans') await refreshPlanUsersResetSchedule(env, b.id);
     return json({ ok: true, data: await first(env.DB, `SELECT * FROM ${table} WHERE id=?`, b.id) }, 201);
   }
   if (!id) return json({ ok: false, error: 'missing_id' }, 400);
@@ -311,6 +319,7 @@ async function tableApi(request, env, table, id, allowed, defaults) {
     if ('quota_gb' in b) b.quota_bytes = gbToBytes(b.quota_gb);
     if ('default_user_quota_gb' in b) b.default_user_quota_bytes = gbToBytes(b.default_user_quota_gb);
     await patchRow(env, table, id, allowed, b);
+    if (table === 'plans') await refreshPlanUsersResetSchedule(env, id);
     return json({ ok: true, data: await first(env.DB, `SELECT * FROM ${table} WHERE id=?`, id) });
   }
   if (request.method === 'DELETE') {
@@ -329,7 +338,7 @@ async function bootstrap(env, body) {
   const proxyHost = body.proxy_host || env.PROXY_HOST || 'replace-with-your-snippets-worker.workers.dev';
   await env.DB.batch([
     env.DB.prepare("INSERT OR IGNORE INTO \"groups\"(id,name,sort_order,created_at,updated_at) VALUES('default','默认分组',0,?,?)").bind(now, now),
-    env.DB.prepare("INSERT OR IGNORE INTO plans(id,name,quota_bytes,valid_days,device_limit,price_cents,currency,enabled,sort_order,created_at,updated_at) VALUES('monthly-100g','月付 100G',107374182400,30,2,0,'CNY',1,0,?,?)").bind(now, now),
+    env.DB.prepare("INSERT OR IGNORE INTO plans(id,name,quota_bytes,valid_days,device_limit,price_cents,currency,reset_cycle,reset_day,enabled,sort_order,created_at,updated_at) VALUES('monthly-100g','月付 100G',107374182400,30,2,0,'CNY','monthly',1,1,0,?,?)").bind(now, now),
     env.DB.prepare("INSERT OR IGNORE INTO nodes(id,name,address,port,host,sni,path,fp,security,type,group_id,enabled,sort_order,created_at,updated_at) VALUES('native-us','US 原生域名',?,443,?,?,'/node/native-us','chrome','tls','ws','default',1,0,?,?)").bind(proxyHost, proxyHost, proxyHost, now, now),
     env.DB.prepare("INSERT OR IGNORE INTO nodes(id,name,address,port,host,sni,path,fp,security,type,group_id,enabled,sort_order,created_at,updated_at) VALUES('custom','自定义优选 IP','104.17.147.116',443,?,?,'/node/custom','chrome','tls','ws','default',1,99,?,?)").bind(proxyHost, proxyHost, now, now),
   ]);
@@ -342,8 +351,8 @@ async function bootstrap(env, body) {
       const uuid = crypto.randomUUID();
       const sub = token(28);
       await env.DB.prepare(
-        "INSERT INTO users(id,email,name,uuid,sub_token,plan_id,quota_bytes,expires_at,device_limit,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
-      ).bind(id, 'demo@example.com', '演示用户', uuid, sub, 'monthly-100g', 107374182400, now + 30 * DAY, 2, 'active', now, now).run();
+        "INSERT INTO users(id,email,name,uuid,sub_token,plan_id,quota_bytes,expires_at,next_reset_at,device_limit,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+      ).bind(id, 'demo@example.com', '演示用户', uuid, sub, 'monthly-100g', 107374182400, now + 30 * DAY, nextMonthlyReset(now, 1), 2, 'active', now, now).run();
       await setUserGroups(env, id, ['default']);
       user = await userDetail(env, id);
     }
@@ -483,11 +492,65 @@ async function nodeLimitOf(env, userId, nodeId) {
 }
 
 async function userDetail(env, id) {
-  const user = await first(env.DB, "SELECT * FROM users WHERE id=?", id);
+  const user = await maybeResetUser(env, await first(env.DB, "SELECT * FROM users WHERE id=?", id), unix());
   if (!user) return null;
   user.group_ids = (await all(env.DB, "SELECT group_id FROM user_groups WHERE user_id=?", id)).map(r => r.group_id);
   user.node_limits = await nodeLimitsForUser(env, id);
   return user;
+}
+
+async function resetDueUsers(env) {
+  const now = unix();
+  const missing = await all(env.DB,
+    "SELECT u.id FROM users u JOIN plans p ON p.id=u.plan_id " +
+    "WHERE u.status='active' AND p.reset_cycle='monthly' AND COALESCE(u.next_reset_at,0)=0 LIMIT 100");
+  for (const row of missing) await refreshUserResetSchedule(env, row.id);
+  const rows = await all(env.DB,
+    "SELECT u.id,p.reset_day FROM users u JOIN plans p ON p.id=u.plan_id " +
+    "WHERE u.status='active' AND p.reset_cycle='monthly' AND u.next_reset_at>0 AND u.next_reset_at<=? LIMIT 100",
+    now);
+  for (const row of rows) await resetUserUsageCycle(env, row.id, now, row.reset_day);
+}
+
+async function maybeResetUser(env, user, now = unix()) {
+  if (!user) return user;
+  if (Number(user.next_reset_at || 0) > 0 && Number(user.next_reset_at) <= now) {
+    const plan = user.plan_id ? await first(env.DB, "SELECT reset_cycle,reset_day FROM plans WHERE id=?", user.plan_id) : null;
+    if (monthlyPlan(plan)) {
+      await resetUserUsageCycle(env, user.id, now, plan.reset_day);
+      return first(env.DB, "SELECT * FROM users WHERE id=?", user.id);
+    }
+  }
+  if (Number(user.next_reset_at || 0) === 0 && user.plan_id) {
+    await refreshUserResetSchedule(env, user.id);
+    return first(env.DB, "SELECT * FROM users WHERE id=?", user.id);
+  }
+  return user;
+}
+
+async function resetUserUsageCycle(env, userId, now = unix(), resetDay = 1) {
+  const next = nextMonthlyReset(now + DAY, resetDay);
+  await env.DB.batch([
+    env.DB.prepare("UPDATE users SET used_upload=0,used_download=0,last_reset_at=?,next_reset_at=?,updated_at=? WHERE id=?")
+      .bind(now, next, now, userId),
+    env.DB.prepare("UPDATE user_node_limits SET used_upload=0,used_download=0,updated_at=? WHERE user_id=?")
+      .bind(now, userId),
+  ]);
+}
+
+async function refreshUserResetSchedule(env, userId) {
+  const row = await first(env.DB,
+    "SELECT u.id,p.reset_cycle,p.reset_day FROM users u LEFT JOIN plans p ON p.id=u.plan_id WHERE u.id=?",
+    userId);
+  if (!row) return;
+  const next = monthlyPlan(row) ? nextMonthlyReset(unix(), row.reset_day) : 0;
+  await env.DB.prepare("UPDATE users SET next_reset_at=?,updated_at=? WHERE id=?").bind(next, unix(), userId).run();
+}
+
+async function refreshPlanUsersResetSchedule(env, planId) {
+  const plan = await first(env.DB, "SELECT reset_cycle,reset_day FROM plans WHERE id=?", planId);
+  const next = monthlyPlan(plan) ? nextMonthlyReset(unix(), plan.reset_day) : 0;
+  await env.DB.prepare("UPDATE users SET next_reset_at=?,updated_at=? WHERE plan_id=?").bind(next, unix(), planId).run();
 }
 
 async function nodeLimitsForUser(env, userId) {
@@ -531,10 +594,10 @@ function nodeDefaults() {
   return { port: 443, fp: 'chrome', security: 'tls', type: 'ws', enabled: 1, sort_order: 0, default_user_quota_bytes: 0 };
 }
 function planFields() {
-  return ['id', 'name', 'quota_bytes', 'valid_days', 'device_limit', 'speed_limit_bps', 'price_cents', 'currency', 'enabled', 'sort_order', 'created_at', 'updated_at'];
+  return ['id', 'name', 'quota_bytes', 'valid_days', 'device_limit', 'speed_limit_bps', 'price_cents', 'currency', 'reset_cycle', 'reset_day', 'enabled', 'sort_order', 'created_at', 'updated_at'];
 }
 function planDefaults() {
-  return { quota_bytes: 0, valid_days: 30, device_limit: 0, speed_limit_bps: 0, price_cents: 0, currency: 'CNY', enabled: 1, sort_order: 0 };
+  return { quota_bytes: 0, valid_days: 30, device_limit: 0, speed_limit_bps: 0, price_cents: 0, currency: 'CNY', reset_cycle: 'none', reset_day: 1, enabled: 1, sort_order: 0 };
 }
 function groupFields() {
   return ['id', 'name', 'sort_order', 'created_at', 'updated_at'];
@@ -596,7 +659,7 @@ function usedOf(row) {
 }
 function dbVal(k, v) {
   if (k === 'expires_at') return toEpoch(v);
-  if (['quota_bytes', 'expires_at', 'device_limit', 'speed_limit_bps', 'price_cents', 'enabled', 'sort_order', 'port', 'default_user_quota_bytes', 'valid_days'].includes(k)) {
+  if (['quota_bytes', 'expires_at', 'last_reset_at', 'next_reset_at', 'device_limit', 'speed_limit_bps', 'price_cents', 'enabled', 'sort_order', 'port', 'default_user_quota_bytes', 'valid_days', 'reset_day'].includes(k)) {
     return numOr(v, 0);
   }
   return v === undefined ? null : v;
@@ -611,6 +674,21 @@ function gbToBytes(v) {
 function daysToExpiry(days, now) {
   const n = Number(days || 0);
   return n > 0 ? now + Math.floor(n) * DAY : 0;
+}
+function monthlyPlan(plan) {
+  return String(plan?.reset_cycle || '').toLowerCase() === 'monthly';
+}
+function nextMonthlyReset(now, resetDay = 1) {
+  const d = new Date((now + TZ_OFFSET) * 1000);
+  const day = Math.max(1, Math.min(28, Math.floor(Number(resetDay || 1))));
+  let y = d.getUTCFullYear(), m = d.getUTCMonth();
+  let next = Date.UTC(y, m, day, 0, 0, 0) / 1000 - TZ_OFFSET;
+  if (next <= now) {
+    m += 1;
+    if (m > 11) { m = 0; y += 1; }
+    next = Date.UTC(y, m, day, 0, 0, 0) / 1000 - TZ_OFFSET;
+  }
+  return Math.floor(next);
 }
 function numOr(v, d) {
   if (v === '' || v === undefined || v === null) return Number(d || 0);
@@ -685,15 +763,15 @@ body{margin:0;font:14px Arial;background:#0f1115;color:#e7e9ee}.wrap{max-width:1
 <section><h3>用户列表</h3><div id=users></div></section>
 <section><h3>单用户节点流量限制</h3><div class=row><select id=limitUser></select><button onclick=loadNodeLimits()>加载用户节点</button><button onclick=saveNodeLimits()>保存节点上限</button></div><p class=mini>这里设置的是“某个用户在某个节点”的独立 GB 上限。0 表示不限；超过后该用户访问该节点会断开。</p><div id=nodeLimits></div></section>
 <section><h3>自定义节点管理</h3><div class=grid><input id=nid placeholder="节点 ID，例如 us-01"><input id=nname placeholder="节点名称"><input id=naddr placeholder="入口地址 / 优选 IP / 域名"><input id=nport placeholder="端口，默认 443"><input id=nhost placeholder="代理 Worker 域名，默认 111.freelx.net"><input id=ngroup placeholder="所属分组 ID，默认 default"><input id=npath placeholder="/node/us-01"><input id=nquota placeholder="默认单用户节点上限 GB，0 不限"><input id=nsort placeholder="排序，数字越小越靠前"><select id=nenabled><option value=1>启用</option><option value=0>禁用</option></select></div><p class=row><button id=nsave onclick=saveNode()>保存节点</button><button onclick=resetNodeForm()>清空表单</button></p><p class=mini>入口地址可以是优选 IP，也可以是域名；Host/SNI 应保持为你的代理 Worker 域名：${defaultProxyHost}。</p><textarea id=nbulk placeholder="批量导入，每行一个：&#10;104.17.147.116:443#US-优选1&#10;104.19.146.223:443#US-优选2&#10;custom-sg,104.18.1.1:443,SG-自定义,default,10"></textarea><p class=row><button onclick=importNodes()>批量导入节点</button></p><div id=nodes></div></section>
-<section><h3>套餐和分组</h3><div class=row><input id=pname placeholder="套餐名称"><input id=pquota placeholder="套餐总流量 GB"><input id=pdays placeholder="有效天数，0 永不过期"><button onclick=createPlan()>创建套餐</button><input id=gname placeholder="分组名称"><button onclick=createGroup()>创建分组</button></div><div id=plans></div><div id=groups></div></section>
+<section><h3>套餐和分组</h3><div class=row><input id=pname placeholder="套餐名称"><input id=pquota placeholder="套餐总流量 GB"><input id=pdays placeholder="有效天数，0 永不过期"><select id=preset><option value=none>不自动重置</option><option value=monthly>月租：每月重置流量</option></select><input id=presetday placeholder="每月几号重置，默认 1"><button onclick=createPlan()>创建套餐</button><input id=gname placeholder="分组名称"><button onclick=createGroup()>创建分组</button></div><div id=plans></div><div id=groups></div></section>
 <section><h3>最近连接</h3><div id=sessions></div></section></div>
 <script>
-const $=id=>document.getElementById(id),DH=${JSON.stringify(defaultProxyHost)};let userRows=[],nodeRows=[],limitRows=[],editingNode='';const L={users:'用户总数',activeUsers:'正常用户',activeNodes:'启用节点',activeSessions:'在线连接',trafficBytes:'已用流量',email:'账号',name:'名称',status:'状态',plan_name:'套餐',groups:'分组',used:'已用/总量',expire:'到期时间',sub:'订阅链接 / 操作',id:'ID',address:'入口地址',port:'端口',host:'Host',path:'路径',group_id:'分组',enabled:'启用',node_ops:'节点操作',default_user_quota_bytes:'节点默认上限',quota_bytes:'总流量',valid_days:'有效天数',device_limit:'设备数',node_name:'节点',quota_limit:'节点上限',node_used:'节点已用',upload:'上传',download:'下载',reason:'断开原因'};
+const $=id=>document.getElementById(id),DH=${JSON.stringify(defaultProxyHost)};let userRows=[],nodeRows=[],limitRows=[],editingNode='';const L={users:'用户总数',activeUsers:'正常用户',activeNodes:'启用节点',activeSessions:'在线连接',trafficBytes:'已用流量',email:'账号',name:'名称',status:'状态',plan_name:'套餐',groups:'分组',used:'已用/总量',expire:'到期时间',next_reset:'下次重置',sub:'订阅链接 / 操作',id:'ID',address:'入口地址',port:'端口',host:'Host',path:'路径',group_id:'分组',enabled:'启用',node_ops:'节点操作',default_user_quota_bytes:'节点默认上限',quota_bytes:'总流量',valid_days:'有效天数',device_limit:'设备数',reset_policy:'月租重置',node_name:'节点',quota_limit:'节点上限',node_used:'节点已用',upload:'上传',download:'下载',reason:'断开原因'};
 const api=(p,o={})=>fetch('/api/admin/'+p,{...o,headers:{'content-type':'application/json','authorization':'Bearer '+localStorage.token,...(o.headers||{})}}).then(async r=>{let j=await r.json().catch(()=>({ok:false,error:r.statusText}));if(!r.ok||j.ok===false)throw new Error(j.error||r.statusText);return j});
 t.value=localStorage.token||'';function save(){localStorage.token=t.value.trim();msg.textContent='Token 已保存'}function b(x){return (Number(x||0)/1073741824).toFixed(2)+' GB'}function gbv(x){let n=Number(x||0)/1073741824;return n?Number(n.toFixed(3)):0}function dt(x){return x?new Date(x*1000).toLocaleString():'永不过期'}
-async function loadAll(){try{msg.textContent='正在加载...';let s=await api('summary');sum.innerHTML=Object.entries(s.data).map(([k,v])=>'<div class=card><b>'+h(L[k]||k)+'</b><br>'+(/Bytes/.test(k)?b(v):h(v))+'</div>').join('');let [us,ns,ps,gs,ss]=await Promise.all([api('users'),api('nodes'),api('plans'),api('groups'),api('sessions')]);userRows=us.data||[];nodeRows=ns.data||[];uplan.innerHTML='<option value="">不绑定套餐</option>'+ps.data.map(p=>'<option value="'+h(p.id)+'">'+h(p.name)+'</option>').join('');fillLimitUsers();users.innerHTML=tbl(userRows,['email','name','status','plan_name','groups','used','expire','sub']);nodes.innerHTML=tbl(nodeRows,['id','name','address','port','host','path','group_id','default_user_quota_bytes','enabled','node_ops']);plans.innerHTML=tbl(ps.data,['id','name','quota_bytes','valid_days','device_limit','enabled']);groups.innerHTML=tbl(gs.data,['id','name']);sessions.innerHTML=tbl(ss.data,['id','email','node_name','status','upload','download','reason']);msg.textContent='数据已刷新';}catch(e){msg.textContent='错误：'+e.message}}
+async function loadAll(){try{msg.textContent='正在加载...';let s=await api('summary');sum.innerHTML=Object.entries(s.data).map(([k,v])=>'<div class=card><b>'+h(L[k]||k)+'</b><br>'+(/Bytes/.test(k)?b(v):h(v))+'</div>').join('');let [us,ns,ps,gs,ss]=await Promise.all([api('users'),api('nodes'),api('plans'),api('groups'),api('sessions')]);userRows=us.data||[];nodeRows=ns.data||[];uplan.innerHTML='<option value="">不绑定套餐</option>'+ps.data.map(p=>'<option value="'+h(p.id)+'">'+h(p.name)+'</option>').join('');fillLimitUsers();users.innerHTML=tbl(userRows,['email','name','status','plan_name','groups','used','expire','next_reset','sub']);nodes.innerHTML=tbl(nodeRows,['id','name','address','port','host','path','group_id','default_user_quota_bytes','enabled','node_ops']);plans.innerHTML=tbl(ps.data,['id','name','quota_bytes','valid_days','reset_policy','device_limit','enabled']);groups.innerHTML=tbl(gs.data,['id','name']);sessions.innerHTML=tbl(ss.data,['id','email','node_name','status','upload','download','reason']);msg.textContent='数据已刷新';}catch(e){msg.textContent='错误：'+e.message}}
 function tbl(rows,cols){if(!rows||!rows.length)return '<p class=muted>暂无数据</p>';return '<table><tr>'+cols.map(c=>'<th>'+h(L[c]||c)+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+cell(r,c)+'</td>').join('')+'</tr>').join('')+'</table>'}
-function cell(r,c){if(c==='used')return b((r.used_upload||0)+(r.used_download||0))+' / '+(r.quota_bytes?b(r.quota_bytes):'不限');if(c==='expire')return dt(r.expires_at);if(c==='sub'){let u=subUrl(r);return '<div class=mono>'+h(u)+'</div><p class=ops><button onclick="copySub(\\''+r.sub_token+'\\')">复制订阅</button><button onclick="selectLimitUser(\\''+r.id+'\\')">节点限额</button><button onclick="resetU(\\''+r.id+'\\')">重置流量</button></p>'}if(c==='node_ops')return '<span class=ops><button onclick="editNode(\\''+h(r.id)+'\\')">编辑</button><button onclick="toggleNode(\\''+h(r.id)+'\\','+(r.enabled?0:1)+')">'+(r.enabled?'禁用':'启用')+'</button><button onclick="copyPath(\\''+h(r.path||('/node/'+r.id))+'\\')">复制路径</button></span>';if(c==='upload')return b(r.upload_bytes);if(c==='download')return b(r.download_bytes);if(c==='reason')return h(r.close_reason||'');if(c==='enabled')return r.enabled?'<span class=ok>是</span>':'<span class=bad>否</span>';if(c==='default_user_quota_bytes'||c==='quota_bytes')return r[c]?b(r[c]):'不限';if(c==='valid_days')return Number(r[c]||0)?h(r[c]):'永不过期';return '<span class=mono>'+h(r[c]??'')+'</span>'}
+function cell(r,c){if(c==='used')return b((r.used_upload||0)+(r.used_download||0))+' / '+(r.quota_bytes?b(r.quota_bytes):'不限');if(c==='expire')return dt(r.expires_at);if(c==='next_reset')return r.next_reset_at?dt(r.next_reset_at):'不重置';if(c==='sub'){let u=subUrl(r);return '<div class=mono>'+h(u)+'</div><p class=ops><button onclick="copySub(\\''+r.sub_token+'\\')">复制订阅</button><button onclick="selectLimitUser(\\''+r.id+'\\')">节点限额</button><button onclick="resetU(\\''+r.id+'\\')">重置流量</button></p>'}if(c==='node_ops')return '<span class=ops><button onclick="editNode(\\''+h(r.id)+'\\')">编辑</button><button onclick="toggleNode(\\''+h(r.id)+'\\','+(r.enabled?0:1)+')">'+(r.enabled?'禁用':'启用')+'</button><button onclick="copyPath(\\''+h(r.path||('/node/'+r.id))+'\\')">复制路径</button></span>';if(c==='upload')return b(r.upload_bytes);if(c==='download')return b(r.download_bytes);if(c==='reason')return h(r.close_reason||'');if(c==='enabled')return r.enabled?'<span class=ok>是</span>':'<span class=bad>否</span>';if(c==='default_user_quota_bytes'||c==='quota_bytes')return r[c]?b(r[c]):'不限';if(c==='valid_days')return Number(r[c]||0)?h(r[c]):'永不过期';if(c==='reset_policy')return r.reset_cycle==='monthly'?'每月 '+h(r.reset_day||1)+' 号重置':'不自动重置';return '<span class=mono>'+h(r[c]??'')+'</span>'}
 function subUrl(r){return location.origin+'/sub/'+r.sub_token}
 async function copySub(tok){let u=location.origin+'/sub/'+tok;await navigator.clipboard.writeText(u);msg.textContent='订阅链接已复制：'+u}
 async function resetU(id){await api('users/'+id+'/reset-usage',{method:'POST'});msg.textContent='流量已重置';loadAll()}
@@ -716,7 +794,7 @@ function parseNodeLine(line,i){let a=line.split(',').map(x=>x.trim());let id='',
 function parseAddr(v){if(!v)return{};if(v[0]=='['){let m=v.match(/^\\[([^\\]]+)\\](?::(\\d+))?$/);if(m)return{address:m[1],port:Number(m[2]||443)}}let i=v.lastIndexOf(':');return i>0&&/^\\d+$/.test(v.slice(i+1))?{address:v.slice(0,i),port:Number(v.slice(i+1))}:{address:v,port:443}}
 function safeId(v){return String(v||'node').toLowerCase().replace(/[^a-z0-9_.-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,48)||('node-'+Date.now())}
 function throwMsg(t){msg.textContent=t;throw new Error(t)}
-async function createPlan(){let id=pname.value.toLowerCase().replace(/[^a-z0-9]+/g,'-')||('plan-'+Date.now());await api('plans',{method:'POST',body:JSON.stringify({id,name:pname.value,quota_gb:pquota.value||0,valid_days:pdays.value||0})});msg.textContent='套餐已创建';loadAll()}
+async function createPlan(){let id=pname.value.toLowerCase().replace(/[^a-z0-9]+/g,'-')||('plan-'+Date.now());await api('plans',{method:'POST',body:JSON.stringify({id,name:pname.value,quota_gb:pquota.value||0,valid_days:pdays.value||0,reset_cycle:preset.value,reset_day:presetday.value||1})});msg.textContent='套餐已创建';loadAll()}
 async function createGroup(){let id=gname.value.toLowerCase().replace(/[^a-z0-9]+/g,'-')||('group-'+Date.now());await api('groups',{method:'POST',body:JSON.stringify({id,name:gname.value})});msg.textContent='分组已创建';loadAll()}
 async function boot(){let proxy=prompt('请输入代理 Worker 域名，例如 proxy.example.com');if(!proxy)return;await api('bootstrap',{method:'POST',body:JSON.stringify({proxy_host:proxy,create_demo_user:true})});msg.textContent='默认数据已初始化';loadAll()}
 function h(v){return String(v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
