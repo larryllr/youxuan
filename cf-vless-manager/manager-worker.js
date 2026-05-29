@@ -478,7 +478,7 @@ function nodeRemark(node) {
   if (!region) return base;
   const upper = base.toUpperCase();
   if (upper === region || upper.startsWith(region + ' ') || upper.startsWith(region + '-') || upper.startsWith(`[${region}]`)) return base;
-  return `[${region}] ${base}`;
+  return `${region}-${base}`;
 }
 
 function normalizeRegion(value) {
