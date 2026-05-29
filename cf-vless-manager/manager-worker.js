@@ -60,9 +60,7 @@ export class UsageMeter {
     if (!access.ok) return access;
 
     if (user.device_limit > 0) {
-      const active = await first(this.env.DB,
-        "SELECT COUNT(*) c FROM sessions WHERE user_id=? AND closed_at IS NULL AND last_seen_at>?",
-        user.id, now - SESSION_ACTIVE_WINDOW);
+      const active = await activeDeviceCount(this.env, user.id, now);
       if (Number(active?.c || 0) >= Number(user.device_limit)) {
         return { ok: false, error: 'device_limit' };
       }
@@ -508,6 +506,15 @@ async function checkUserOnly(user, now) {
   if (Number(user.expires_at || 0) > 0 && Number(user.expires_at) <= now) return { ok: false, error: 'expired' };
   if (!quotaOk(user, 0)) return { ok: false, error: 'quota_exceeded' };
   return { ok: true };
+}
+
+async function activeDeviceCount(env, userId, now = unix()) {
+  return first(env.DB,
+    "SELECT COUNT(*) c FROM (" +
+    "SELECT COALESCE(ip,'') ip,COALESCE(ua,'') ua FROM sessions " +
+    "WHERE user_id=? AND closed_at IS NULL AND last_seen_at>? GROUP BY COALESCE(ip,''),COALESCE(ua,'')" +
+    ")",
+    userId, now - SESSION_ACTIVE_WINDOW);
 }
 
 async function userByUuid(env, uuid) {
