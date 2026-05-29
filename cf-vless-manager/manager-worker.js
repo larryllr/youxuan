@@ -6,6 +6,8 @@ const H_JSON = { 'content-type': 'application/json; charset=utf-8', 'cache-contr
 const H_TEXT = { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' };
 const DAY = 86400;
 const TZ_OFFSET = 8 * 3600;
+const SESSION_ACTIVE_WINDOW = 120;
+const SESSION_STALE_WINDOW = 300;
 
 export default {
   async fetch(request, env) {
@@ -60,7 +62,7 @@ export class UsageMeter {
     if (user.device_limit > 0) {
       const active = await first(this.env.DB,
         "SELECT COUNT(*) c FROM sessions WHERE user_id=? AND closed_at IS NULL AND last_seen_at>?",
-        user.id, now - 120);
+        user.id, now - SESSION_ACTIVE_WINDOW);
       if (Number(active?.c || 0) >= Number(user.device_limit)) {
         return { ok: false, error: 'device_limit' };
       }
@@ -391,7 +393,7 @@ async function summary(env) {
     first(env.DB, "SELECT COUNT(*) c FROM users"),
     first(env.DB, "SELECT COUNT(*) c FROM users WHERE status='active'"),
     first(env.DB, "SELECT COUNT(*) c FROM nodes WHERE enabled=1"),
-    first(env.DB, "SELECT COUNT(*) c FROM sessions WHERE closed_at IS NULL AND last_seen_at>?", unix() - 120),
+    first(env.DB, "SELECT COUNT(*) c FROM sessions WHERE closed_at IS NULL AND last_seen_at>?", unix() - SESSION_ACTIVE_WINDOW),
     first(env.DB, "SELECT COALESCE(SUM(used_upload+used_download),0) total FROM users"),
   ]);
   return {
@@ -444,14 +446,14 @@ function buildVlessLink(uuid, node, env, request) {
   const address = String(node.address || host).includes(':') && !String(node.address || host).startsWith('[')
     ? `[${node.address}]`
     : (node.address || host);
-  return `vless://${uuid}@${address}:${node.port || 443}?${params.toString()}#${encodeURIComponent(node.name || node.id || 'node')}`;
+  return `vless://${uuid}@${address}:${node.port || 443}?${params.toString()}#${encodeURIComponent(nodeRemark(node))}`;
 }
 
 function toClashYaml(user, nodes, env, request) {
   const proxyLines = nodes.map(n => {
     const host = n.host || env.PROXY_HOST || new URL(request.url).hostname;
     const path = normalizePath(n.path || `/node/${n.id || 'default'}`);
-    const name = yaml(n.name || n.id || 'node');
+    const name = yaml(nodeRemark(n));
     return [
       `  - name: ${name}`,
       `    type: vless`,
@@ -468,8 +470,21 @@ function toClashYaml(user, nodes, env, request) {
       `        Host: ${yaml(host)}`,
     ].join('\n');
   });
-  const names = nodes.map(n => yaml(n.name || n.id || 'node')).join(', ');
+  const names = nodes.map(n => yaml(nodeRemark(n))).join(', ');
   return `mixed-port: 7890\nallow-lan: false\nmode: rule\nproxies:\n${proxyLines.join('\n')}\nproxy-groups:\n  - name: AUTO\n    type: select\n    proxies: [${names}]\nrules:\n  - MATCH,AUTO\n`;
+}
+
+function nodeRemark(node) {
+  const base = String(node?.name || node?.id || 'node').trim();
+  const region = normalizeRegion(node?.region);
+  if (!region) return base;
+  const upper = base.toUpperCase();
+  if (upper === region || upper.startsWith(region + ' ') || upper.startsWith(region + '-') || upper.startsWith(`[${region}]`)) return base;
+  return `[${region}] ${base}`;
+}
+
+function normalizeRegion(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 16);
 }
 
 async function checkAccess(env, user, node, now, checkNodeGroup = true) {
@@ -527,6 +542,7 @@ async function userDetail(env, id) {
 
 async function resetDueUsers(env) {
   const now = unix();
+  await closeStaleSessions(env, now);
   const missing = await all(env.DB,
     "SELECT u.id FROM users u JOIN plans p ON p.id=u.plan_id " +
     "WHERE u.status='active' AND p.reset_cycle='monthly' AND COALESCE(u.next_reset_at,0)=0 LIMIT 100");
@@ -536,6 +552,12 @@ async function resetDueUsers(env) {
     "WHERE u.status='active' AND p.reset_cycle='monthly' AND u.next_reset_at>0 AND u.next_reset_at<=? LIMIT 100",
     now);
   for (const row of rows) await resetUserUsageCycle(env, row.id, now, row.reset_day);
+}
+
+async function closeStaleSessions(env, now = unix()) {
+  await env.DB.prepare(
+    "UPDATE sessions SET closed_at=?,status='closed',close_reason='stale' WHERE closed_at IS NULL AND last_seen_at<?"
+  ).bind(now, now - SESSION_STALE_WINDOW).run();
 }
 
 async function maybeResetUser(env, user, now = unix()) {
@@ -788,15 +810,15 @@ body{margin:0;font:14px Arial;background:#0f1115;color:#e7e9ee}.wrap{max-width:1
 <section><h3>用户管理</h3><div class=grid><input id=uid placeholder="用户 ID，留空自动生成"><input id=uemail placeholder="邮箱 / 账号"><input id=uname placeholder="用户名称"><input id=uuid placeholder="UUID，留空自动生成"><input id=usub placeholder="订阅 Token，留空自动生成"><select id=uplan></select><input id=ugroups placeholder="分组 ID，多个用逗号分隔"><input id=uq placeholder="总流量 GB，留空使用套餐"><input id=uup placeholder="已用上传 GB"><input id=udown placeholder="已用下载 GB"><input id=udays placeholder="到期天数，创建时可用"><input id=uexp placeholder="到期时间戳，0 永不过期"><input id=unext placeholder="下次重置时间戳，0 不重置"><input id=udev placeholder="设备并发数，0 不限"><input id=uspeed placeholder="限速 bps，0 不限"><select id=ustatus><option value=active>正常</option><option value=disabled>禁用</option><option value=expired>过期</option></select></div><textarea id=unote placeholder="备注"></textarea><p class=row><button id=usave onclick=saveUser()>保存用户</button><button onclick=resetUserForm()>清空表单</button></p></section>
 <section><h3>用户列表</h3><div id=users></div></section>
 <section><h3>单用户节点流量限制</h3><div class=row><select id=limitUser></select><button onclick=loadNodeLimits()>加载用户节点</button><button onclick=saveNodeLimits()>保存节点上限</button></div><p class=mini>这里设置的是“某个用户在某个节点”的独立 GB 上限。0 表示不限；超过后该用户访问该节点会断开。</p><div id=nodeLimits></div></section>
-<section><h3>自定义节点管理</h3><div class=grid><input id=nid placeholder="节点 ID，例如 us-01"><input id=nname placeholder="节点名称"><input id=naddr placeholder="入口地址 / 优选 IP / 域名"><input id=nport placeholder="端口，默认 443"><input id=nhost placeholder="代理 Worker 域名，默认 111.freelx.net"><input id=ngroup placeholder="所属分组 ID，默认 default"><input id=npath placeholder="/node/us-01"><input id=nquota placeholder="默认单用户节点上限 GB，0 不限"><input id=nsort placeholder="排序，数字越小越靠前"><select id=nenabled><option value=1>启用</option><option value=0>禁用</option></select></div><p class=row><button id=nsave onclick=saveNode()>保存节点</button><button onclick=resetNodeForm()>清空表单</button></p><p class=mini>入口地址可以是优选 IP，也可以是域名；Host/SNI 应保持为你的代理 Worker 域名：${defaultProxyHost}。</p><textarea id=nbulk placeholder="批量导入，每行一个：&#10;104.17.147.116:443#US-优选1&#10;104.19.146.223:443#US-优选2&#10;custom-sg,104.18.1.1:443,SG-自定义,default,10"></textarea><p class=row><button onclick=importNodes()>批量导入节点</button></p><div id=nodes></div></section>
+<section><h3>自定义节点管理</h3><div class=grid><input id=nid placeholder="节点 ID，例如 us-01"><input id=nname placeholder="节点名称"><input id=nregion placeholder="地区，例如 US/HK/JP"><input id=naddr placeholder="入口地址 / 优选 IP / 域名"><input id=nport placeholder="端口，默认 443"><input id=nhost placeholder="代理 Worker 域名，默认 111.freelx.net"><input id=ngroup placeholder="所属分组 ID，默认 default"><input id=npath placeholder="/node/us-01"><input id=nquota placeholder="默认单用户节点上限 GB，0 不限"><input id=nsort placeholder="排序，数字越小越靠前"><select id=nenabled><option value=1>启用</option><option value=0>禁用</option></select></div><p class=row><button id=nsave onclick=saveNode()>保存节点</button><button onclick=resetNodeForm()>清空表单</button></p><p class=mini>入口地址可以是优选 IP，也可以是域名；Host/SNI 应保持为你的代理 Worker 域名：${defaultProxyHost}。地区会写入订阅名称，便于 v2rayNG 显示。</p><textarea id=nbulk placeholder="批量导入，每行一个：&#10;104.17.147.116:443#US-优选1&#10;104.19.146.223:443#US-优选2&#10;custom-sg,104.18.1.1:443,SG-自定义,default,10,US"></textarea><p class=row><button onclick=importNodes()>批量导入节点</button></p><div id=nodes></div></section>
 <section><h3>套餐管理</h3><div class=grid><input id=pid placeholder="套餐 ID，留空自动生成"><input id=pname placeholder="套餐名称"><input id=pquota placeholder="套餐总流量 GB，0 不限"><input id=pdays placeholder="有效天数，0 永不过期"><input id=pdev placeholder="设备并发数，0 不限"><input id=pspeed placeholder="限速 bps，0 不限"><input id=pprice placeholder="价格，单位元"><input id=pcurrency placeholder="币种，默认 CNY"><select id=preset><option value=none>不自动重置</option><option value=monthly>月租：每月重置流量</option></select><input id=presetday placeholder="每月几号重置，默认 1"><input id=psort placeholder="排序，数字越小越靠前"><select id=penabled><option value=1>启用</option><option value=0>禁用</option></select></div><p class=row><button id=psave onclick=savePlan()>保存套餐</button><button onclick=resetPlanForm()>清空表单</button></p><div id=plans></div></section>
 <section><h3>分组管理</h3><div class=row><input id=gid placeholder="分组 ID，留空自动生成"><input id=gname placeholder="分组名称"><input id=gsort placeholder="排序，数字越小越靠前"><button id=gsave onclick=saveGroup()>保存分组</button><button onclick=resetGroupForm()>清空表单</button></div><div id=groups></div></section>
 <section><h3>最近连接</h3><div id=sessions></div></section></div>
 <script>
-const $=id=>document.getElementById(id),DH=${JSON.stringify(defaultProxyHost)};let userRows=[],nodeRows=[],planRows=[],groupRows=[],limitRows=[],editingUser='',editingNode='',editingPlan='',editingGroup='';const L={users:'用户总数',activeUsers:'正常用户',activeNodes:'启用节点',activeSessions:'在线连接',trafficBytes:'已用流量',email:'账号',name:'名称',status:'状态',plan_name:'套餐',groups:'分组',used:'已用/总量',expire:'到期时间',next_reset:'下次重置',sub:'订阅链接 / 操作',id:'ID',address:'入口地址',port:'端口',host:'Host',path:'路径',group_id:'分组',enabled:'启用',node_ops:'节点操作',plan_ops:'套餐操作',group_ops:'分组操作',default_user_quota_bytes:'节点默认上限',quota_bytes:'总流量',valid_days:'有效天数',device_limit:'设备数',speed_limit_bps:'限速',price:'价格',sort_order:'排序',reset_policy:'月租重置',node_name:'节点',quota_limit:'节点上限',node_used:'节点已用',upload:'上传',download:'下载',reason:'断开原因'};
+const $=id=>document.getElementById(id),DH=${JSON.stringify(defaultProxyHost)};let userRows=[],nodeRows=[],planRows=[],groupRows=[],limitRows=[],editingUser='',editingNode='',editingPlan='',editingGroup='';const L={users:'用户总数',activeUsers:'正常用户',activeNodes:'启用节点',activeSessions:'在线连接',trafficBytes:'已用流量',email:'账号',name:'名称',status:'状态',plan_name:'套餐',groups:'分组',used:'已用/总量',expire:'到期时间',next_reset:'下次重置',sub:'订阅链接 / 操作',id:'ID',address:'入口地址',port:'端口',host:'Host',path:'路径',group_id:'分组',region:'地区',enabled:'启用',node_ops:'节点操作',plan_ops:'套餐操作',group_ops:'分组操作',default_user_quota_bytes:'节点默认上限',quota_bytes:'总流量',valid_days:'有效天数',device_limit:'设备数',speed_limit_bps:'限速',price:'价格',sort_order:'排序',reset_policy:'月租重置',node_name:'节点',quota_limit:'节点上限',node_used:'节点已用',upload:'上传',download:'下载',reason:'断开原因'};
 const api=(p,o={})=>fetch('/api/admin/'+p,{...o,headers:{'content-type':'application/json','authorization':'Bearer '+localStorage.token,...(o.headers||{})}}).then(async r=>{let j=await r.json().catch(()=>({ok:false,error:r.statusText}));if(!r.ok||j.ok===false)throw new Error(j.error||r.statusText);return j});
 t.value=localStorage.token||'';function save(){localStorage.token=t.value.trim();msg.textContent='Token 已保存'}function b(x){return (Number(x||0)/1073741824).toFixed(2)+' GB'}function gbv(x){let n=Number(x||0)/1073741824;return n?Number(n.toFixed(3)):0}function dt(x){return x?new Date(x*1000).toLocaleString():'永不过期'}
-async function loadAll(){try{msg.textContent='正在加载...';let s=await api('summary');sum.innerHTML=Object.entries(s.data).map(([k,v])=>'<div class=card><b>'+h(L[k]||k)+'</b><br>'+(/Bytes/.test(k)?b(v):h(v))+'</div>').join('');let [us,ns,ps,gs,ss]=await Promise.all([api('users'),api('nodes'),api('plans'),api('groups'),api('sessions')]);userRows=us.data||[];nodeRows=ns.data||[];planRows=ps.data||[];groupRows=gs.data||[];uplan.innerHTML='<option value="">不绑定套餐</option>'+planRows.filter(p=>p.enabled).map(p=>'<option value="'+h(p.id)+'">'+h(p.name)+'</option>').join('');fillLimitUsers();users.innerHTML=tbl(userRows,['email','name','status','plan_name','groups','used','expire','next_reset','sub']);nodes.innerHTML=tbl(nodeRows,['id','name','address','port','host','path','group_id','default_user_quota_bytes','enabled','node_ops']);plans.innerHTML=tbl(planRows,['id','name','quota_bytes','valid_days','reset_policy','device_limit','speed_limit_bps','price','sort_order','enabled','plan_ops']);groups.innerHTML=tbl(groupRows,['id','name','sort_order','group_ops']);sessions.innerHTML=tbl(ss.data,['id','email','node_name','status','upload','download','reason']);msg.textContent='数据已刷新';}catch(e){msg.textContent='错误：'+e.message}}
+async function loadAll(){try{msg.textContent='正在加载...';let s=await api('summary');sum.innerHTML=Object.entries(s.data).map(([k,v])=>'<div class=card><b>'+h(L[k]||k)+'</b><br>'+(/Bytes/.test(k)?b(v):h(v))+'</div>').join('');let [us,ns,ps,gs,ss]=await Promise.all([api('users'),api('nodes'),api('plans'),api('groups'),api('sessions')]);userRows=us.data||[];nodeRows=ns.data||[];planRows=ps.data||[];groupRows=gs.data||[];uplan.innerHTML='<option value="">不绑定套餐</option>'+planRows.filter(p=>p.enabled).map(p=>'<option value="'+h(p.id)+'">'+h(p.name)+'</option>').join('');fillLimitUsers();users.innerHTML=tbl(userRows,['email','name','status','plan_name','groups','used','expire','next_reset','sub']);nodes.innerHTML=tbl(nodeRows,['id','name','region','address','port','host','path','group_id','default_user_quota_bytes','enabled','node_ops']);plans.innerHTML=tbl(planRows,['id','name','quota_bytes','valid_days','reset_policy','device_limit','speed_limit_bps','price','sort_order','enabled','plan_ops']);groups.innerHTML=tbl(groupRows,['id','name','sort_order','group_ops']);sessions.innerHTML=tbl(ss.data,['id','email','node_name','status','upload','download','reason']);msg.textContent='数据已刷新';}catch(e){msg.textContent='错误：'+e.message}}
 function tbl(rows,cols){if(!rows||!rows.length)return '<p class=muted>暂无数据</p>';return '<table><tr>'+cols.map(c=>'<th>'+h(L[c]||c)+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+cell(r,c)+'</td>').join('')+'</tr>').join('')+'</table>'}
 function cell(r,c){if(c==='used')return b((r.used_upload||0)+(r.used_download||0))+' / '+(r.quota_bytes?b(r.quota_bytes):'不限');if(c==='expire')return dt(r.expires_at);if(c==='next_reset')return r.next_reset_at?dt(r.next_reset_at):'不重置';if(c==='sub'){let u=subUrl(r);return '<div class=mono>'+h(u)+'</div><p class=ops><button onclick="editUser(\\''+r.id+'\\')">编辑</button><button onclick="copySub(\\''+r.sub_token+'\\')">复制订阅</button><button onclick="selectLimitUser(\\''+r.id+'\\')">节点限额</button><button onclick="resetU(\\''+r.id+'\\')">重置流量</button><button onclick="deleteUser(\\''+r.id+'\\')">删除用户</button></p>'}if(c==='node_ops')return '<span class=ops><button onclick="editNode(\\''+h(r.id)+'\\')">编辑</button><button onclick="toggleNode(\\''+h(r.id)+'\\','+(r.enabled?0:1)+')">'+(r.enabled?'禁用':'启用')+'</button><button onclick="copyPath(\\''+h(r.path||('/node/'+r.id))+'\\')">复制路径</button><button onclick="deleteNode(\\''+h(r.id)+'\\')">删除</button></span>';if(c==='plan_ops')return '<span class=ops><button onclick="editPlan(\\''+h(r.id)+'\\')">编辑</button><button onclick="togglePlan(\\''+h(r.id)+'\\','+(r.enabled?0:1)+')">'+(r.enabled?'禁用':'启用')+'</button><button onclick="deletePlan(\\''+h(r.id)+'\\')">删除</button></span>';if(c==='group_ops')return '<span class=ops><button onclick="editGroup(\\''+h(r.id)+'\\')">编辑</button><button onclick="deleteGroup(\\''+h(r.id)+'\\')">删除</button></span>';if(c==='upload')return b(r.upload_bytes);if(c==='download')return b(r.download_bytes);if(c==='reason')return h(r.close_reason||'');if(c==='enabled')return r.enabled?'<span class=ok>是</span>':'<span class=bad>否</span>';if(c==='default_user_quota_bytes'||c==='quota_bytes')return r[c]?b(r[c]):'不限';if(c==='valid_days')return Number(r[c]||0)?h(r[c]):'永不过期';if(c==='speed_limit_bps')return Number(r[c]||0)?h(r[c])+' bps':'不限';if(c==='price')return ((Number(r.price_cents||0)/100).toFixed(2))+' '+h(r.currency||'CNY');if(c==='reset_policy')return r.reset_cycle==='monthly'?'每月 '+h(r.reset_day||1)+' 号重置':'不自动重置';return '<span class=mono>'+h(r[c]??'')+'</span>'}
 function subUrl(r){return location.origin+'/sub/'+r.sub_token}
@@ -814,17 +836,19 @@ async function saveNodeLimits(){let id=limitUser.value;if(!id)return msg.textCon
 function nodeLimitCell(r,c){if(c==='quota_limit')return '<input id="'+limId(r.node_id)+'" value="'+gbv(r.quota_bytes)+'" placeholder="GB，0 不限">';if(c==='node_used')return b((r.used_upload||0)+(r.used_download||0));if(c==='status')return '<select id="st_'+limId(r.node_id)+'"><option value=active '+(r.status==='active'?'selected':'')+'>启用</option><option value=disabled '+(r.status==='disabled'?'selected':'')+'>禁用</option></select>';return '<span class=mono>'+h(r[c]??'')+'</span>'}
 function nodeLimitTable(rows){let cols=['node_id','node_name','quota_limit','node_used','status'];return '<table><tr>'+cols.map(c=>'<th>'+h(L[c]||c)+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+nodeLimitCell(r,c)+'</td>').join('')+'</tr>').join('')+'</table>'}
 function limId(v){return 'lim_'+String(v).replace(/[^a-zA-Z0-9_-]/g,'_')}
-function nodeBody(){let id=safeId(nid.value||nname.value||naddr.value);nid.value=id;let host=(nhost.value||DH).trim();return{id,name:nname.value||id,address:naddr.value.trim(),port:Number(nport.value||443),host,sni:host,path:npath.value||('/node/'+id),group_id:ngroup.value||'default',default_user_quota_gb:Number(nquota.value||0),sort_order:Number(nsort.value||0),enabled:Number(nenabled.value)}} 
+function nodeBody(){let id=safeId(nid.value||nname.value||naddr.value);nid.value=id;let host=(nhost.value||DH).trim();return{id,name:nname.value||id,region:cleanRegion(nregion.value),address:naddr.value.trim(),port:Number(nport.value||443),host,sni:host,path:npath.value||('/node/'+id),group_id:ngroup.value||'default',default_user_quota_gb:Number(nquota.value||0),sort_order:Number(nsort.value||0),enabled:Number(nenabled.value)}} 
 async function saveNode(){let b=nodeBody();if(!b.id||!b.address)throwMsg('节点 ID 和入口地址不能为空');if(editingNode){b.id=editingNode;await api('nodes/'+editingNode,{method:'PATCH',body:JSON.stringify(b)});msg.textContent='节点已更新'}else{await api('nodes',{method:'POST',body:JSON.stringify(b)});msg.textContent='节点已创建'}resetNodeForm();loadAll()}
-function editNode(id){let r=nodeRows.find(x=>x.id===id);if(!r)return;nid.value=r.id;nname.value=r.name||'';naddr.value=r.address||'';nport.value=r.port||443;nhost.value=r.host||DH;ngroup.value=r.group_id||'default';npath.value=r.path||('/node/'+r.id);nquota.value=gbv(r.default_user_quota_bytes);nsort.value=r.sort_order||0;nenabled.value=r.enabled?1:0;editingNode=id;nsave.textContent='保存修改';msg.textContent='正在编辑节点：'+id;scrollTo({top:0,behavior:'smooth'})}
-function resetNodeForm(){editingNode='';for(const x of [nid,nname,naddr,nport,nhost,ngroup,npath,nquota,nsort])x.value='';nenabled.value=1;nsave.textContent='保存节点'}
+function editNode(id){let r=nodeRows.find(x=>x.id===id);if(!r)return;nid.value=r.id;nname.value=r.name||'';nregion.value=r.region||'';naddr.value=r.address||'';nport.value=r.port||443;nhost.value=r.host||DH;ngroup.value=r.group_id||'default';npath.value=r.path||('/node/'+r.id);nquota.value=gbv(r.default_user_quota_bytes);nsort.value=r.sort_order||0;nenabled.value=r.enabled?1:0;editingNode=id;nsave.textContent='保存修改';msg.textContent='正在编辑节点：'+id;scrollTo({top:0,behavior:'smooth'})}
+function resetNodeForm(){editingNode='';for(const x of [nid,nname,nregion,naddr,nport,nhost,ngroup,npath,nquota,nsort])x.value='';nenabled.value=1;nsave.textContent='保存节点'}
 async function toggleNode(id,en){await api('nodes/'+id,{method:'PATCH',body:JSON.stringify({enabled:en})});msg.textContent=en?'节点已启用':'节点已禁用';loadAll()}
 async function deleteNode(id){if(!confirm('确定删除节点 '+id+' 吗？该节点会从订阅中移除，并清理所有用户在该节点的独立限额。'))return;await api('nodes/'+id,{method:'DELETE'});if(editingNode===id)resetNodeForm();msg.textContent='节点已删除';loadAll()}
 async function copyPath(p){await navigator.clipboard.writeText(p);msg.textContent='节点路径已复制：'+p}
 async function importNodes(){let lines=nbulk.value.replace(/\\r/g,'').split('\\n').map(x=>x.trim()).filter(Boolean);let ok=0;for(const line of lines){let n=parseNodeLine(line,ok+1);if(!n)continue;try{let exists=nodeRows.some(x=>x.id===n.id);await api(exists?('nodes/'+n.id):'nodes',{method:exists?'PATCH':'POST',body:JSON.stringify(n)});ok++}catch(e){msg.textContent='导入失败：'+line+' '+e.message;return}}msg.textContent='已导入 '+ok+' 个节点';nbulk.value='';loadAll()}
-function parseNodeLine(line,i){let a=line.split(',').map(x=>x.trim());let id='',addr='',name='',group='default',quota=0;if(a.length>=3){id=safeId(a[0]);addr=a[1];name=a[2];group=a[3]||'default';quota=Number(a[4]||0)}else{let h=line.indexOf('#');addr=(h>=0?line.slice(0,h):line).trim();name=(h>=0?line.slice(h+1):'自定义节点-'+i).trim();id=safeId(name||addr)}let p=parseAddr(addr),host=DH;return p.address?{id,name:name||id,address:p.address,port:p.port||443,host,sni:host,path:'/node/'+id,group_id:group||'default',default_user_quota_gb:quota,sort_order:50+i,enabled:1}:null}
+function parseNodeLine(line,i){let a=line.split(',').map(x=>x.trim());let id='',addr='',name='',group='default',quota=0,region='';if(a.length>=3){id=safeId(a[0]);addr=a[1];name=a[2];group=a[3]||'default';quota=Number(a[4]||0);region=cleanRegion(a[5]||inferRegion(name||id))}else{let h=line.indexOf('#');addr=(h>=0?line.slice(0,h):line).trim();name=(h>=0?line.slice(h+1):'自定义节点-'+i).trim();id=safeId(name||addr);region=inferRegion(name)}let p=parseAddr(addr),host=DH;return p.address?{id,name:name||id,region,address:p.address,port:p.port||443,host,sni:host,path:'/node/'+id,group_id:group||'default',default_user_quota_gb:quota,sort_order:50+i,enabled:1}:null}
 function parseAddr(v){if(!v)return{};if(v[0]=='['){let m=v.match(/^\\[([^\\]]+)\\](?::(\\d+))?$/);if(m)return{address:m[1],port:Number(m[2]||443)}}let i=v.lastIndexOf(':');return i>0&&/^\\d+$/.test(v.slice(i+1))?{address:v.slice(0,i),port:Number(v.slice(i+1))}:{address:v,port:443}}
 function safeId(v){return String(v||'node').toLowerCase().replace(/[^a-z0-9_.-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,48)||('node-'+Date.now())}
+function cleanRegion(v){return String(v||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'').slice(0,16)}
+function inferRegion(v){let m=String(v||'').toUpperCase().match(/\\b(US|HK|JP|SG|KR|DE|NL|GB|FI|SE)\\b/);return m?m[1]:''}
 function throwMsg(t){msg.textContent=t;throw new Error(t)}
 function planBody(){let id=safeId(pid.value||pname.value||('plan-'+Date.now()));pid.value=id;return{id,name:pname.value||id,quota_gb:pquota.value||0,valid_days:pdays.value||0,device_limit:Number(pdev.value||0),speed_limit_bps:Number(pspeed.value||0),price_cents:Math.round(Number(pprice.value||0)*100),currency:(pcurrency.value||'CNY').trim().toUpperCase(),reset_cycle:preset.value,reset_day:Number(presetday.value||1),sort_order:Number(psort.value||0),enabled:Number(penabled.value)}}
 async function savePlan(){let b=planBody();if(!b.id||!b.name)throwMsg('套餐 ID 和名称不能为空');if(editingPlan){b.id=editingPlan;await api('plans/'+editingPlan,{method:'PATCH',body:JSON.stringify(b)});msg.textContent='套餐已更新'}else{await api('plans',{method:'POST',body:JSON.stringify(b)});msg.textContent='套餐已创建'}resetPlanForm();loadAll()}
