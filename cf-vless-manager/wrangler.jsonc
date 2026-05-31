@@ -1,13 +1,14 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cf-vless-manager",
+  "account_id": "replace-with-account-id",
   "main": "manager-worker.js",
   "compatibility_date": "2026-05-28",
   "observability": {
     "enabled": true
   },
   "vars": {
-    "PROXY_HOST": "111.freelx.net"
+    "PROXY_HOST": "your-snippet-domain.example.com"
   },
   "triggers": {
     "crons": [
@@ -18,7 +19,7 @@
     {
       "binding": "DB",
       "database_name": "cf-vless-manager",
-      "database_id": "a70bde8b-3c53-40f7-b4da-8e848f19b5ed"
+      "database_id": "replace-with-d1-database-id"
     }
   ],
   "durable_objects": {
