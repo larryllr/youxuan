@@ -47,7 +47,8 @@ async function handleSubscription(request, env) {
   const allNodes = [...nodes, ...custom];
   if (!allNodes.length) return new Response('', { status: 204, headers: H_TEXT });
 
-  const links = allNodes.map(n => buildVlessLink(user, n, env, request));
+  const regionOverride = normalizeRegion(url.searchParams.get('region') || url.searchParams.get('r'));
+  const links = allNodes.map(n => buildVlessLink(user, n, env, request, regionOverride));
   const format = (url.searchParams.get('format') || 'base64').toLowerCase();
   const headers = {
     ...H_TEXT,
@@ -55,7 +56,7 @@ async function handleSubscription(request, env) {
     'profile-update-interval': '12',
   };
   if (format === 'raw') return new Response(links.join('\n'), { headers });
-  if (format === 'clash') return new Response(toClashYaml(user, allNodes, env, request), {
+  if (format === 'clash') return new Response(toClashYaml(user, allNodes, env, request, regionOverride), {
     headers: { ...headers, 'content-type': 'text/yaml; charset=utf-8' },
   });
   return new Response(btoa(links.join('\n')), { headers });
@@ -280,11 +281,12 @@ async function handleEdge(request, env) {
   return json({ ok: true });
 }
 
-function buildVlessLink(user, node, env, request) {
+function buildVlessLink(user, node, env, request, regionOverride = '') {
   const host = node.host || env.PROXY_HOST || new URL(request.url).hostname;
   const sni = node.sni || host;
   const rawPath = normalizePath(node.path || `/node/${node.id || 'default'}`);
-  const regionPath = normalizeRegion(node.region) ? `/r/${normalizeRegion(node.region)}` : '';
+  const region = normalizeRegion(regionOverride) || normalizeRegion(node.region);
+  const regionPath = region ? `/r/${region}` : '';
   const path = `/t/${encodeURIComponent(user.sub_token)}${regionPath}${rawPath}`;
   const mismatch = certNameMismatch(node.address || host, sni);
   const strictCert = String(env.SUB_STRICT_CERT ?? '0') !== '0';
@@ -302,17 +304,18 @@ function buildVlessLink(user, node, env, request) {
   }
   const target = strictCert && mismatch ? host : (node.address || host);
   const address = String(target).includes(':') && !String(target).startsWith('[') ? `[${target}]` : target;
-  return `vless://${user.uuid}@${address}:${strictCert && mismatch ? 443 : (node.port || 443)}?${params.toString()}#${encodeURIComponent(nodeRemark(node))}`;
+  return `vless://${user.uuid}@${address}:${strictCert && mismatch ? 443 : (node.port || 443)}?${params.toString()}#${encodeURIComponent(nodeRemark(node, region))}`;
 }
 
-function toClashYaml(user, nodes, env, request) {
+function toClashYaml(user, nodes, env, request, regionOverride = '') {
   const proxyLines = nodes.map(n => {
     const host = n.host || env.PROXY_HOST || new URL(request.url).hostname;
     const sni = n.sni || host;
     const rawPath = normalizePath(n.path || `/node/${n.id || 'default'}`);
-    const regionPath = normalizeRegion(n.region) ? `/r/${normalizeRegion(n.region)}` : '';
+    const region = normalizeRegion(regionOverride) || normalizeRegion(n.region);
+    const regionPath = region ? `/r/${region}` : '';
     const path = `/t/${encodeURIComponent(user.sub_token)}${regionPath}${rawPath}`;
-    const name = yaml(nodeRemark(n));
+    const name = yaml(nodeRemark(n, region));
     const mismatch = certNameMismatch(n.address || host, sni);
     const strictCert = String(env.SUB_STRICT_CERT ?? '0') !== '0';
     const server = strictCert && mismatch ? host : (n.address || host);
@@ -333,13 +336,13 @@ function toClashYaml(user, nodes, env, request) {
       `        Host: ${yaml(host)}`,
     ].join('\n');
   });
-  const names = nodes.map(n => yaml(nodeRemark(n))).join(', ');
+  const names = nodes.map(n => yaml(nodeRemark(n, normalizeRegion(regionOverride) || normalizeRegion(n.region)))).join(', ');
   return `mixed-port: 7890\nallow-lan: false\nmode: rule\nproxies:\n${proxyLines.join('\n')}\nproxy-groups:\n  - name: AUTO\n    type: select\n    proxies: [${names}]\nrules:\n  - MATCH,AUTO\n`;
 }
 
-function nodeRemark(node) {
+function nodeRemark(node, regionValue = '') {
   const base = String(node?.name || node?.id || 'node').trim();
-  const region = normalizeRegion(node?.region);
+  const region = normalizeRegion(regionValue) || normalizeRegion(node?.region);
   if (!region) return base;
   const upper = base.toUpperCase();
   if (upper === region || upper.startsWith(region + ' ') || upper.startsWith(region + '-') || upper.startsWith(`[${region}]`)) return base;
@@ -639,7 +642,7 @@ function adminPage(env = {}) {
   const html = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>VLESS 订阅管理</title>
 <style>
 body{margin:0;font:14px Arial;background:#0f1115;color:#e7e9ee}.wrap{max-width:1180px;margin:auto;padding:20px}input,select,textarea,button{background:#171b22;color:#e7e9ee;border:1px solid #303644;border-radius:6px;padding:9px;box-sizing:border-box}textarea{width:100%;min-height:120px}button{cursor:pointer;background:#23344d}button:hover{background:#2d4364}table{width:100%;border-collapse:collapse;margin:12px 0;table-layout:auto}td,th{border-bottom:1px solid #242a35;padding:8px;text-align:left;vertical-align:top}th{color:#b8c1d1;font-weight:600}section{margin:18px 0;padding:14px;background:#151922;border:1px solid #242a35;border-radius:8px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.card{background:#171b22;border:1px solid #303644;border-radius:8px;padding:12px}.muted{color:#9aa3b2}.row{display:flex;gap:8px;flex-wrap:wrap}.ok{color:#67e08b}.bad{color:#ff8d8d}.wide{min-width:320px}.mono{font-family:Consolas,monospace;word-break:break-all}.mini{font-size:12px;color:#9aa3b2}.ops button{margin:0 5px 5px 0}.editpanel{background:#101722;border:1px solid #33415a;border-radius:8px;padding:12px;margin:4px 0 10px}.editgrid{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px}.editgrid label{display:flex;flex-direction:column;gap:5px;color:#9aa3b2;font-size:12px}.editgrid input,.editgrid select{width:100%}.editactions{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}.nowrap{white-space:nowrap}pre{white-space:pre-wrap;word-break:break-all;background:#090b0f;padding:10px;border-radius:6px}
-</style><div class=wrap><h2>VLESS 订阅管理</h2><section><div class=row><input id=t class=wide placeholder="管理员 Token / ADMIN_TOKEN"><button onclick=save()>保存 Token</button><button onclick=boot()>初始化默认数据</button><button onclick=loadAll()>刷新数据</button></div><p class=muted id=msg></p></section><div class=cards id=sum></div>
+</style><div class=wrap><h2>VLESS 订阅管理</h2><section><div class=row><input id=t class=wide placeholder="管理员 Token / ADMIN_TOKEN"><button onclick=save()>保存 Token</button><button onclick=boot()>初始化默认数据</button><button onclick=loadAll()>刷新数据</button></div><p class=muted id=msg></p></section><section><h3>临时订阅地区</h3><div class=row><select id=subRegion onchange=saveSubRegion()><option value="">按节点代码地区</option><option value=US>US</option><option value=HK>HK</option><option value=JP>JP</option><option value=SG>SG</option><option value=KR>KR</option><option value=DE>DE</option><option value=NL>NL</option><option value=GB>GB</option></select><input id=subRegionCustom placeholder="自定义地区，例如 US/HK/JP" oninput=saveSubRegion()><button onclick=clearSubRegion()>恢复默认</button></div><p class=mini>这里只影响管理页复制出来的这批订阅链接，生成链接会追加 ?region=地区；留空时仍按每个节点保存的地区生成，不改变节点、不改连接转发逻辑。</p></section><div class=cards id=sum></div>
 <section><h3>用户管理</h3><div class=grid><input id=uid placeholder="用户 ID，留空自动生成"><input id=uemail placeholder="邮箱 / 账号"><input id=uname placeholder="用户名称"><input id=uuid placeholder="UUID，留空自动生成"><input id=usub placeholder="订阅 Token，留空自动生成"><input id=ugroups placeholder="分组 ID，多个用逗号分隔"><input id=udays placeholder="到期天数，0 永不过期"><input id=uexp placeholder="到期时间戳，0 永不过期"><input id=uhours placeholder="剩余小时，0 断网"><select id=uhen><option value=0>剩余小时不生效</option><option value=1>剩余小时生效</option></select><select id=ustatus><option value=active>正常</option><option value=disabled>禁用</option><option value=expired>过期</option></select></div><textarea id=unote placeholder="备注"></textarea><p class=row><button id=usave onclick=saveUser()>保存用户</button><button onclick=resetUserForm()>清空表单</button></p></section>
 <section><h3>用户列表</h3><div id=users></div></section>
 <section><h3>单用户节点权限</h3><div class=row><select id=limitUser></select><button onclick=loadNodeLimits()>加载用户节点</button><button onclick=saveNodeLimits()>保存节点权限</button></div><div id=nodeLimits></div></section>
@@ -650,6 +653,11 @@ body{margin:0;font:14px Arial;background:#0f1115;color:#e7e9ee}.wrap{max-width:1
 const $=id=>document.getElementById(id),DH=${JSON.stringify(defaultProxyHost)};let userRows=[],nodeRows=[],groupRows=[],limitRows=[],editingUser='',editingNode='',inlineNode='',editingGroup='';const L={users:'用户总数',activeUsers:'正常用户',activeNodes:'启用节点',email:'账号',name:'名称',status:'状态',groups:'分组',expire:'到期时间',hours:'剩余小时',sub:'订阅链接 / 操作',id:'ID',address:'入口地址',port:'端口',host:'Host',path:'路径',group_id:'分组',region:'地区',enabled:'启用',node_ops:'节点操作',group_ops:'分组操作',sort_order:'排序',node_name:'节点'};
 const api=(p,o={})=>fetch('/api/admin/'+p,{...o,headers:{'content-type':'application/json','authorization':'Bearer '+localStorage.token,...(o.headers||{})}}).then(async r=>{let j=await r.json().catch(()=>({ok:false,error:r.statusText}));if(!r.ok||j.ok===false)throw new Error(j.error||r.statusText);return j});
 t.value=localStorage.token||'';function save(){localStorage.token=t.value.trim();msg.textContent='Token 已保存'}function dt(x){return x?new Date(x*1000).toLocaleString():'永不过期'}
+function currentSubRegion(){return cleanRegion((subRegionCustom.value||subRegion.value||''))}
+function regionQuery(){let r=currentSubRegion();return r?'?region='+encodeURIComponent(r):''}
+function saveSubRegion(){let r=currentSubRegion();localStorage.subRegion=r;subRegion.value=['','US','HK','JP','SG','KR','DE','NL','GB'].includes(r)?r:'';if(subRegion.value)subRegionCustom.value='';if(userRows.length)users.innerHTML=tbl(userRows,['email','name','status','groups','expire','hours','sub']);msg.textContent=r?'临时订阅地区：'+r:'已恢复按节点代码地区'}
+function clearSubRegion(){subRegion.value='';subRegionCustom.value='';saveSubRegion()}
+function initSubRegion(){let r=cleanRegion(localStorage.subRegion||'');if(['US','HK','JP','SG','KR','DE','NL','GB'].includes(r))subRegion.value=r;else subRegionCustom.value=r}
 async function loadAll(){try{msg.textContent='正在加载...';let s=await api('summary');sum.innerHTML=Object.entries(s.data).map(([k,v])=>'<div class=card><b>'+h(L[k]||k)+'</b><br>'+h(v)+'</div>').join('');let [us,ns,gs]=await Promise.all([api('users'),api('nodes'),api('groups')]);userRows=us.data||[];nodeRows=ns.data||[];groupRows=gs.data||[];fillLimitUsers();users.innerHTML=tbl(userRows,['email','name','status','groups','expire','hours','sub']);nodes.innerHTML=nodesTable();groups.innerHTML=tbl(groupRows,['id','name','sort_order','group_ops']);msg.textContent='数据已刷新';}catch(e){msg.textContent='错误：'+e.message}}
 function tbl(rows,cols){if(!rows||!rows.length)return '<p class=muted>暂无数据</p>';return '<table><tr>'+cols.map(c=>'<th>'+h(L[c]||c)+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+cell(r,c)+'</td>').join('')+'</tr>').join('')+'</table>'}
 function nodesTable(){let cols=['id','name','region','address','port','host','path','group_id','enabled','node_ops'];if(!nodeRows.length)return '<p class=muted>暂无数据</p>';return '<table><tr>'+cols.map(c=>'<th>'+h(L[c]||c)+'</th>').join('')+'</tr>'+nodeRows.map(r=>nodeReadRow(r,cols)+(inlineNode===r.id?nodeEditPanel(r,cols.length):'')).join('')+'</table>'}
@@ -657,8 +665,8 @@ function nodeReadRow(r,cols){return '<tr>'+cols.map(c=>'<td class="'+(c==='id'||
 function nodeEditPanel(r,colspan){let k=safeDom(r.id);return '<tr><td colspan="'+colspan+'"><div class=editpanel><div class=mini>正在编辑：<span class=mono>'+h(r.id)+'</span></div><div class=editgrid>'+nodeEditField(k,'名称','name',r.name||'')+nodeEditField(k,'地区','region',r.region||'')+nodeEditField(k,'入口地址','address',r.address||'')+nodeEditField(k,'端口','port',r.port||443)+nodeEditField(k,'Host','host',r.host||DH)+nodeEditField(k,'路径','path',r.path||('/node/'+r.id))+nodeEditField(k,'分组','group_id',r.group_id||'default')+'<label>启用<select id="en_enabled_'+k+'"><option value=1 '+(r.enabled?'selected':'')+'>启用</option><option value=0 '+(!r.enabled?'selected':'')+'>禁用</option></select></label></div><div class=editactions><button onclick="cancelInlineNode()">取消</button><button onclick="saveInlineNode(\\''+h(r.id)+'\\')">保存</button></div></div></td></tr>'}
 function nodeEditField(k,label,name,value){return '<label>'+label+'<input id="en_'+name+'_'+k+'" value="'+h(value)+'"></label>'}
 function cell(r,c){if(c==='expire')return dt(r.expires_at);if(c==='hours')return r.hours_enabled?'<span class=mono>'+h(r.remaining_hours||0)+' 小时</span>':'不生效';if(c==='sub'){let u=subUrl(r);return '<div class=mono>'+h(u)+'</div><p class=ops><button onclick="editUser(\\''+r.id+'\\')">编辑</button><button onclick="copySub(\\''+r.sub_token+'\\')">复制订阅</button><button onclick="selectLimitUser(\\''+r.id+'\\')">节点权限</button><button onclick="deleteUser(\\''+r.id+'\\')">删除用户</button></p>'}if(c==='node_ops')return '<span class=ops><button onclick="editNode(\\''+h(r.id)+'\\')">编辑</button><button onclick="toggleNode(\\''+h(r.id)+'\\','+(r.enabled?0:1)+')">'+(r.enabled?'禁用':'启用')+'</button><button onclick="copyPath(\\''+h(r.path||('/node/'+r.id))+'\\')">复制路径</button><button onclick="deleteNode(\\''+h(r.id)+'\\')">删除</button></span>';if(c==='group_ops')return '<span class=ops><button onclick="editGroup(\\''+h(r.id)+'\\')">编辑</button><button onclick="deleteGroup(\\''+h(r.id)+'\\')">删除</button></span>';if(c==='enabled')return r.enabled?'<span class=ok>是</span>':'<span class=bad>否</span>';return '<span class=mono>'+h(r[c]??'')+'</span>'}
-function subUrl(r){return location.origin+'/sub/'+r.sub_token}
-async function copySub(tok){let u=location.origin+'/sub/'+tok;await navigator.clipboard.writeText(u);msg.textContent='订阅链接已复制：'+u}
+function subUrl(r){return location.origin+'/sub/'+r.sub_token+regionQuery()}
+async function copySub(tok){let u=location.origin+'/sub/'+tok+regionQuery();await navigator.clipboard.writeText(u);msg.textContent='订阅链接已复制：'+u}
 async function deleteUser(id){if(!confirm('确定删除这个用户吗？该用户的订阅和节点权限都会删除。'))return;await api('users/'+id,{method:'DELETE'});msg.textContent='用户已删除';loadAll()}
 function userBody(){let id=safeId(uid.value||uemail.value||uname.value||('user-'+Date.now()));uid.value=id;let body={id,email:uemail.value,name:uname.value,uuid:uuid.value.trim()||undefined,sub_token:usub.value.trim()||undefined,group_ids:ugroups.value.split(',').map(x=>x.trim()).filter(Boolean),remaining_hours:Number(uhours.value||0),hours_enabled:Number(uhen.value||0),status:ustatus.value,note:unote.value};if(uexp.value!=='')body.expires_at=Number(uexp.value||0);else if(udays.value!=='')body.valid_days=udays.value;return body}
 async function saveUser(){let b=userBody();if(!b.id)throwMsg('用户 ID 不能为空');if(editingUser){b.id=editingUser;await api('users/'+editingUser,{method:'PATCH',body:JSON.stringify(b)});msg.textContent='用户已保存'}else{await api('users',{method:'POST',body:JSON.stringify(b)});msg.textContent='用户已创建'}resetUserForm();loadAll()}
@@ -695,7 +703,7 @@ function resetGroupForm(){editingGroup='';gid.readOnly=false;for(const x of [gid
 async function deleteGroup(id){if(!confirm('确定删除分组 '+id+' 吗？用户分组绑定会删除，节点会移到默认分组。'))return;await api('groups/'+id,{method:'DELETE'});if(editingGroup===id)resetGroupForm();msg.textContent='分组已删除';loadAll()}
 async function boot(){let proxy=prompt('请输入代理 Worker 域名，例如 proxy.example.com');if(!proxy)return;await api('bootstrap',{method:'POST',body:JSON.stringify({proxy_host:proxy,create_demo_user:true})});msg.textContent='默认数据已初始化';loadAll()}
 function h(v){return String(v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-loadAll();
+initSubRegion();loadAll();
 </script>`;
   return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
 }
