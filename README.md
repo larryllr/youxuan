@@ -12,3 +12,16 @@
 默认路径为llr,删除了之前我自己加上去的ech功能
 (部署用min后缀的混淆版,人家还是2.9版本,已经四个多月不维护了,我直接充当维护大师替作者更新好吧)
 但是生成订阅格式只有base64，正常也够用
+
+## 当前项目对应文件
+
+详细对应关系见 `PROJECTS.md`。
+
+| 项目 | 域名 | 部署用混淆版 |
+| --- | --- | --- |
+| 111 | 111.freelx.net | `projects/111-us-managed-current.min.js` |
+| 222 | 222.freelx.net | `projects/222-us-fast-noregion-current.min.js` |
+| 333 | 333.freelx.net | `projects/333-hk-region-current.min.js` |
+| 444 | 444.freelx.net | `projects/444-us-light-current.min.js` |
+
+222 当前已回退到无 `/r/US/` 地区路径版本，保留 512KB 上传队列。
